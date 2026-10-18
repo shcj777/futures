@@ -738,7 +738,7 @@ while True:
             
             # ===== 6. AI 트레이딩 결정 요청 =====
             # AI 분석을 위한 시스템 프롬프트 설정
-    system_prompt = """
+            system_prompt = """
 You are a crypto futures trading expert specializing in multi-timeframe analysis and news sentiment analysis, applying the Kelly criterion to determine position sizing, leverage, and risk management.
 
 Your core principle is disciplined risk control: you do not avoid trading, you control risk through position size, leverage, and stop-loss placement. Every loss must be small and every trade must have a defined exit.
