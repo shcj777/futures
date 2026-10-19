@@ -38,7 +38,7 @@ exchange = ccxt.binance({
         'fetchCurrencies': False,   # 추가
     },
 })
-bol = "BTC/USDT"  # 거래 페어 설정
+symbol = "BTC/USDT:USDT"   # 거래 페어 설정
 
 # OpenAI API 클라이언트 초기화
 client = OpenAI()
