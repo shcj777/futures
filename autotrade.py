@@ -29,15 +29,16 @@ from datetime import datetime  # 날짜 및 시간 처리
 api_key = os.getenv("BINANCE_API_KEY")  # 바이낸스 API 키
 secret = os.getenv("BINANCE_SECRET_KEY")  # 바이낸스 시크릿 키
 exchange = ccxt.binance({
-    'apiKey': api_key,
+    'apiKey': api_key,          # 기존 변수명 그대로 두세요
     'secret': secret,
-    'enableRateLimit': True,  # API 호출 제한 준수
+    'enableRateLimit': True,    # 기존에 있으면 유지
     'options': {
-        'defaultType': 'future',  # 선물 거래 설정
-        'adjustForTimeDifference': True  # 시간대 차이 조정
-    }
+        'defaultType': 'future',
+        'portfolioMargin': True,    # 추가
+        'fetchCurrencies': False,   # 추가
+    },
 })
-symbol = "BTC/USDT"  # 거래 페어 설정
+bol = "BTC/USDT"  # 거래 페어 설정
 
 # OpenAI API 클라이언트 초기화
 client = OpenAI()
