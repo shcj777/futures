@@ -623,6 +623,37 @@ def handle_position_closure(current_price, side, amount, current_trade_id=None):
                 print(f"Avg P/L %: {summary['avg_profit_loss_percentage']:.2f}%")
                 print("=============================")
 
+# ===== 오픈 프로텍션함수 추가 ===== 
+class ProtectionError(Exception):
+    pass               
+def open_with_protection(side, amount, entry_hint, sl_pct, tp_pct):
+    """시장가 진입 후 SL/TP 설정. SL/TP가 실패하면 즉시 청산하고 예외를 발생시킴."""
+    close_side = 'sell' if side == 'buy' else 'buy'
+    order = exchange.create_order(symbol, 'market', side, amount)
+    entry = float(order.get('average') or order.get('price') or entry_hint)
+
+    if side == 'buy':
+        sl = round(entry * (1 - sl_pct), 2)
+        tp = round(entry * (1 + tp_pct), 2)
+    else:
+        sl = round(entry * (1 + sl_pct), 2)
+        tp = round(entry * (1 - tp_pct), 2)
+
+    try:
+        exchange.create_order(symbol, 'STOP_MARKET', close_side, amount, None,
+                              {'stopPrice': sl, 'reduceOnly': True})
+        exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', close_side, amount, None,
+                              {'stopPrice': tp, 'reduceOnly': True})
+    except Exception as e:
+        print("SL/TP 주문 실패, 포지션 즉시 청산:", e)
+        try:
+            exchange.create_order(symbol, 'market', close_side, amount, None, {'reduceOnly': True})
+        except Exception as e2:
+            print("!!! 청산도 실패. 바이낸스 앱에서 직접 확인하세요:", e2)
+        raise ProtectionError("보호 주문 실패로 진입 취소")
+
+    return order, entry, sl, tp
+
 # ===== 메인 프로그램 시작 =====
 print("\n=== Bitcoin Trading Bot Started ===")
 print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -696,10 +727,13 @@ while True:
             
             # 포지션이 없을 경우, 남아있는 미체결 주문 취소
             try:
-                open_orders = exchange.fetch_open_orders(symbol)
-                if open_orders:
-                    for order in open_orders:
-                        exchange.cancel_order(order['id'], symbol)
+                normal = exchange.fetch_open_orders(symbol)
+                conditional = exchange.fetch_open_orders(symbol, params={'stop': True})
+                for o in normal:
+                    exchange.cancel_order(o['id'], symbol)
+                for o in conditional:
+                    exchange.cancel_order(o['id'], symbol, params={'stop': True})
+                if normal or conditional:
                     print("Cancelled remaining open orders for", symbol)
                 else:
                     print("No remaining open orders to cancel.")
@@ -884,52 +918,52 @@ IMPORTANT: Do not format your response as a code block. Do not include ```json, 
                     time.sleep(60)  # 포지션 없을 때 1분 대기
                     continue
                     
+
                 # ===== 9. 투자 금액 계산 =====
-                # 현재 잔액 확인
                 balance = exchange.fetch_balance()
-                available_capital = balance['USDT']['free']  # 가용 USDT 잔액
-                
-                # AI 추천 포지션 크기 비율 적용
+                free = balance.get('free', {})
+                available_capital = free.get('USDT') or free.get('USDC') or 0
+                if available_capital <= 0:
+                    raise RuntimeError(f"사용 가능한 마진 잔고 없음: {free}")
+    
                 position_size_percentage = trading_decision['recommended_position_size']
                 investment_amount = available_capital * position_size_percentage
-                
-                # 최소 주문 금액 확인 (최소 100 USDT)
-                if investment_amount < 100:
-                    investment_amount = 100
-                    print(f"최소 주문 금액(100 USDT)으로 조정됨")
-                
-                print(f"투자 금액: {investment_amount:.2f} USDT")
-                
+
+                MIN_NOTIONAL = 100
+                if investment_amount < MIN_NOTIONAL:
+                    if available_capital < MIN_NOTIONAL * 2:
+                        raise RuntimeError("잔고가 부족해 진입하지 않음")
+                    investment_amount = MIN_NOTIONAL
+                    print(f"최소 주문 금액({MIN_NOTIONAL})으로 조정됨")
+
+                # 시험용 상한 (정상 동작 확인 후 이 줄을 지우세요)
+                investment_amount = min(investment_amount, 200)
+                print(f"투자 금액: {investment_amount:.2f} USD")
+
                 # ===== 10. 주문 수량 계산 =====
-                # BTC 수량 = 투자금액 / 현재가격, 소수점 3자리까지 반올림
                 amount = math.ceil((investment_amount / current_price) * 1000) / 1000
                 print(f"주문 수량: {amount} BTC")
 
                 # ===== 11. 레버리지 설정 =====
-                # AI 추천 레버리지 설정
                 recommended_leverage = trading_decision['recommended_leverage']
-                exchange.set_leverage(recommended_leverage, symbol)
+                try:
+                    exchange.papiPostUmLeverage({
+                        'symbol': exchange.market(symbol)['id'],
+                        'leverage': recommended_leverage,
+                    })
+                except Exception as e:
+                    raise RuntimeError(f"레버리지 설정 실패, 진입 취소: {e}")
                 print(f"레버리지 설정: {recommended_leverage}x")
 
-                # ===== 12. 스탑로스/테이크프로핏 설정 =====
-                # AI 추천 SL/TP 비율 가져오기
+                # ===== 12. 스탑로스/테이크프로핏 비율 =====
                 sl_percentage = trading_decision['stop_loss_percentage']
                 tp_percentage = trading_decision['take_profit_percentage']
 
                 # ===== 13. 포지션 진입 및 SL/TP 주문 실행 =====
-                if action == "long":  # 롱 포지션
-                    # 시장가 매수 주문
-                    order = exchange.create_market_buy_order(symbol, amount)
-                    entry_price = current_price
-                    
-                    # 스탑로스/테이크프로핏 가격 계산
-                    sl_price = round(entry_price * (1 - sl_percentage), 2)   # AI 추천 비율만큼 하락
-                    tp_price = round(entry_price * (1 + tp_percentage), 2)   # AI 추천 비율만큼 상승
-                    
-                    # SL/TP 주문 생성
-                    exchange.create_order(symbol, 'STOP_MARKET', 'sell', amount, None, {'stopPrice': sl_price})
-                    exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', 'sell', amount, None, {'stopPrice': tp_price})
-                    
+                if action == "long":
+                    order, entry_price, sl_price, tp_price = open_with_protection(
+                        'buy', amount, current_price, sl_percentage, tp_percentage)
+
                     # 거래 데이터 저장
                     trade_data = {
                         'action': 'long',
@@ -944,7 +978,7 @@ IMPORTANT: Do not format your response as a code block. Do not include ```json, 
                         'investment_amount': investment_amount
                     }
                     trade_id = save_trade(trade_data)
-                    
+
                     # AI 분석 결과와 거래 연결
                     update_analysis_sql = "UPDATE ai_analysis SET trade_id = ? WHERE id = ?"
                     conn = sqlite3.connect(DB_FILE)
@@ -952,7 +986,7 @@ IMPORTANT: Do not format your response as a code block. Do not include ```json, 
                     cursor.execute(update_analysis_sql, (trade_id, analysis_id))
                     conn.commit()
                     conn.close()
-                    
+
                     print(f"\n=== LONG Position Opened ===")
                     print(f"Entry: ${entry_price:,.2f}")
                     print(f"Stop Loss: ${sl_price:,.2f} (-{sl_percentage*100:.2f}%)")
@@ -961,19 +995,10 @@ IMPORTANT: Do not format your response as a code block. Do not include ```json, 
                     print(f"분석 근거: {trading_decision['reasoning']}")
                     print("===========================")
 
-                elif action == "short":  # 숏 포지션
-                    # 시장가 매도 주문
-                    order = exchange.create_market_sell_order(symbol, amount)
-                    entry_price = current_price
-                    
-                    # 스탑로스/테이크프로핏 가격 계산
-                    sl_price = round(entry_price * (1 + sl_percentage), 2)   # AI 추천 비율만큼 상승
-                    tp_price = round(entry_price * (1 - tp_percentage), 2)   # AI 추천 비율만큼 하락
-                    
-                    # SL/TP 주문 생성
-                    exchange.create_order(symbol, 'STOP_MARKET', 'buy', amount, None, {'stopPrice': sl_price})
-                    exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', 'buy', amount, None, {'stopPrice': tp_price})
-                    
+                elif action == "short":
+                    order, entry_price, sl_price, tp_price = open_with_protection(
+                        'sell', amount, current_price, sl_percentage, tp_percentage)
+
                     # 거래 데이터 저장
                     trade_data = {
                         'action': 'short',
@@ -988,7 +1013,7 @@ IMPORTANT: Do not format your response as a code block. Do not include ```json, 
                         'investment_amount': investment_amount
                     }
                     trade_id = save_trade(trade_data)
-                    
+
                     # AI 분석 결과와 거래 연결
                     update_analysis_sql = "UPDATE ai_analysis SET trade_id = ? WHERE id = ?"
                     conn = sqlite3.connect(DB_FILE)
@@ -996,7 +1021,7 @@ IMPORTANT: Do not format your response as a code block. Do not include ```json, 
                     cursor.execute(update_analysis_sql, (trade_id, analysis_id))
                     conn.commit()
                     conn.close()
-                    
+
                     print(f"\n=== SHORT Position Opened ===")
                     print(f"Entry: ${entry_price:,.2f}")
                     print(f"Stop Loss: ${sl_price:,.2f} (+{sl_percentage*100:.2f}%)")
@@ -1012,6 +1037,9 @@ IMPORTANT: Do not format your response as a code block. Do not include ```json, 
                 print(f"AI 응답: {response.choices[0].message.content}")
                 time.sleep(30)  # 대기 후 다시 시도
                 continue
+            except ProtectionError as e:
+                print(f"치명적: {e} - 봇을 중지합니다. 바이낸스 앱에서 포지션을 확인하세요.")
+                raise SystemExit(1)
             except Exception as e:
                 print(f"기타 오류: {e}")
                 time.sleep(10)
