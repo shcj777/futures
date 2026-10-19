@@ -1,5 +1,5 @@
 
-Bitcoin bot v3 · PY
+Bitcoinv3 · PY
 """
 비트코인 선물 트레이딩 봇 v3  (규칙 기반 엔진 + 저비용 AI 필터)
 =====================================================================
@@ -14,10 +14,10 @@ v2 대비 변경점
           스탑 이동 실패 시 안전 폴백
  
 실행
-  python bitcoin_bot_v3.py --backtest 90 --sweep   # 점수 하한별 하루 거래수/수익성 비교 (먼저!)
-  python bitcoin_bot_v3.py --backtest 90           # 현재 설정으로 백테스트
-  python bitcoin_bot_v3.py --dry                   # 신호만 기록, 주문 X
-  python bitcoin_bot_v3.py                         # 실거래
+  python bitcoinv3.py --backtest 90 --sweep   # 점수 하한별 하루 거래수/수익성 비교 (먼저!)
+  python bitcoinv3.py --backtest 90           # 현재 설정으로 백테스트
+  python bitcoinv3.py --dry                   # 신호만 기록, 주문 X
+  python bitcoinv3.py                         # 실거래
  
 주의: 하루 5건은 '목표'일 뿐 수익 보장이 아닙니다. 거래를 억지로 늘리면 수수료(왕복 약 0.1%)가
 기대값을 깎습니다. 반드시 --sweep 결과에서 수수료 후 profit_factor 가 1.2 이상인 설정만 쓰세요.
@@ -993,5 +993,3 @@ if __name__ == "__main__":
         run_backtest(args.backtest, args.sweep)
     else:
         main_live(dry=args.dry)
- 
-Claude가 응답을 완료했습니다
