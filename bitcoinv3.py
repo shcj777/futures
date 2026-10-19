@@ -1,6 +1,5 @@
-nano /home/ubuntu/futures/bitcoinv3.py
-python3 /home/ubuntu/futures/bitcoinv3.py
-'''
+python
+"""
 비트코인 선물 트레이딩 봇 v3  (규칙 기반 엔진 + 저비용 AI 필터)
 =====================================================================
 v2 대비 변경점
