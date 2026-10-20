@@ -14,9 +14,9 @@ v3 -> v4 핵심 변경
 ※ 월 30%, 일 1% 같은 수익은 보장되지 않으며, 무리하게 위험을 키우면 청산 위험만 커집니다.
 
 실행
-  python bitcoinv4.py --backtest 180    # 최근 180일 백테스트 (최소 6개월 권장)
-  python bitcoinv4.py --dry             # 신호만 기록, 주문 X
-  python bitcoinv4.py                   # 실거래
+  python bitcoinv3.py --backtest 180    # 최근 180일 백테스트 (최소 6개월 권장)
+  python bitcoinv3.py --dry             # 신호만 기록, 주문 X
+  python bitcoinv3.py                   # 실거래
 """
 import os
 import math
@@ -396,11 +396,10 @@ def get_equity():
     bal = exchange.fetch_balance()
     for key in ('total', 'free'):
         part = bal.get(key, {}) or {}
-        v = part.get('USDT') or part.get('USDC')
-        if v and v > 0:
-            return float(v)
-    raise RuntimeError(f"잔고 조회 실패: {bal.get('free')}")
-
+        v = sum(float(part.get(c) or 0) for c in ('USDT', 'USDC'))
+        if v > 0:
+            return v
+    raise RuntimeError(f"잔고 조회 실패: total={bal.get('total')}, free={bal.get('free')}")
 
 def get_position():
     for pos in exchange.fetch_positions([SYMBOL]):
