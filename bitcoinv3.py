@@ -1,24 +1,26 @@
 """
-비트코인 선물 트레이딩 봇 v3  (규칙 기반 엔진 + 저비용 AI 필터)
+비트코인 선물 트레이딩 봇 v2  (하이브리드: 규칙 기반 엔진 + AI 필터)
 =====================================================================
-v2 대비 변경점
-  [빈도]  진입 타임프레임 5분봉(기본) / 신호 4종(눌림목·돌파·평균회귀·모멘텀) / 기준 완화
-          + 장시간 무거래 시 점수 하한을 최대 6점까지만 단계적으로 완화(품질 바닥선 유지)
-          + --backtest N --sweep 으로 '하루 거래수 vs 수수료 후 기대값'을 직접 측정
-  [비용]  LLM은 '경계선 점수(MIN~LLM_SKIP_SCORE)' 신호에서만 호출, 하루 호출 상한,
-          같은 전략/방향 30분 캐시, 캔들 원본 미전송(요약 지표만), 뉴스 60분 캐시
-          -> 예상 비용: 하루 약 0.001~0.02 USD (v1: 약 1 USD)
-  [안정]  진입가 재조회, 청산 손익 집계 지연 대기, PM 계정 자본 조회, 시간동기화,
-          스탑 이동 실패 시 안전 폴백
+v1의 문제
+  - 15분마다가 아니라 '포지션이 없을 때 60초마다' GPT에 raw 캔들 전체를 보내 비용이 큼 (~$1/일)
+  - LLM이 "확률 p"를 지어내서 Kelly를 계산 -> 근거 없는 수치로 베팅/레버리지 결정
+  - Rule No.1(잃지 마라) 프롬프트 때문에 NO_POSITION 이 대부분 -> 1일 1건
+  - 최소주문금액 강제 상향, ceil 수량, 현재가로 손익 계산 등 리스크/정합성 버그
+ 
+v2 구조
+  1) 지표/신호는 전부 로컬 계산(무료): EMA·RSI·MACD·ADX·ATR·볼린저·돈치안·거래량
+     - A. 추세 눌림목  B. 돌파(스퀴즈 포함)  C. 횡보 평균회귀
+     - 4h/1h 상위 타임프레임 방향 필터 + 펀딩비 필터
+  2) 신호가 나온 순간에만 GPT(mini)에 요약본 전송 -> 승인/거부 + 사이즈 조절 (호출당 약 0.1센트)
+  3) 리스크: 거래당 고정 위험(자본의 0.5%), ATR 기반 SL/TP, 수수료 게이트,
+     일일 손실 한도, 연속손실 쿨다운, 본전 스탑 + 트레일링, 시간 청산
+  4) 전략별 성과를 DB에 기록하고 최근 기대값이 나쁜 전략은 점수를 자동으로 깎음(적응형)
  
 실행
-  python bitcoinv3.py --backtest 90 --sweep   # 점수 하한별 하루 거래수/수익성 비교 (먼저!)
-  python bitcoinv3.py --backtest 90           # 현재 설정으로 백테스트
-  python bitcoinv3.py --dry                   # 신호만 기록, 주문 X
-  python bitcoinv3.py                         # 실거래
- 
-주의: 하루 5건은 '목표'일 뿐 수익 보장이 아닙니다. 거래를 억지로 늘리면 수수료(왕복 약 0.1%)가
-기대값을 깎습니다. 반드시 --sweep 결과에서 수수료 후 profit_factor 가 1.2 이상인 설정만 쓰세요.
+  python bitcoin_bot_v2.py --backtest 30     # 최근 30일 백테스트 (먼저 이걸로 검증!)
+  python bitcoin_bot_v2.py --dry             # 신호만 기록, 주문 X
+  python bitcoin_bot_v2.py                   # 실거래
+주의: 어떤 전략도 수익을 보장하지 않습니다. 백테스트 -> dry -> 소액 순으로 검증하세요.
 """
 import os
 import math
@@ -37,39 +39,31 @@ load_dotenv()
  
 # ===================== 설정 =====================
 SYMBOL = "BTC/USDT:USDT"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.getenv("DB_FILE", os.path.join(BASE_DIR, "bitcoin_trading_v3.db"))
+DB_FILE = "bitcoin_trading.db"
  
-ENTRY_TF = os.getenv("ENTRY_TF", "5m")          # '5m'(거래 많음) 또는 '15m'(거래 적음)
-TF_MIN = {"5m": 5, "15m": 15}[ENTRY_TF]
+RISK_PER_TRADE = 0.005       # 거래당 최대 손실 = 자본의 0.5% (SL 맞으면 이만큼만 잃음)
+MAX_LEVERAGE = 5             # 레버리지 상한 (v1은 20x)
+MAX_MARGIN_USAGE = 0.30      # 증거금은 자본의 30% 이내
+DAILY_LOSS_LIMIT = 0.02      # 하루 -2% 넘으면 당일 거래 중단
+MAX_TRADES_PER_DAY = 12
+MAX_CONSEC_LOSSES = 3        # 연속 3패 -> 쿨다운
+COOLDOWN_MIN = 60
  
-TARGET_TRADES_PER_DAY = 5    # 목표(참고용). 강제 체결 아님
-RISK_PER_TRADE = 0.005       # 거래당 최대 손실 = 자본의 0.5%
-MAX_LEVERAGE = 5
-MAX_MARGIN_USAGE = 0.30
-DAILY_LOSS_LIMIT = 0.02      # 하루 -2% 도달 시 당일 중단
-MAX_TRADES_PER_DAY = 15
-MAX_CONSEC_LOSSES = 3
-COOLDOWN_MIN = 45
- 
-MIN_SCORE = 55               # v2: 62 -> 55 (거래 증가)
-RELAX_FLOOR = 6              # 무거래가 길어질 때 완화 가능한 최대 점수 (하한 49)
-MIN_RR = 1.4
-MIN_TP_PCT = 0.003           # TP 최소 0.3% (왕복 수수료+슬리피지 ~0.12% 대비 2.5배)
-FEE_RATE = 0.0005
+MIN_SCORE = 62               # 신호 점수 하한 (낮추면 거래 증가, 높이면 감소) <- 백테스트로 튜닝
+MIN_RR = 1.5                 # 최소 손익비
+MIN_TP_PCT = 0.0025          # TP 최소 0.25% (왕복 수수료 ~0.1% 대비 최소 2.5배)
+FEE_RATE = 0.0005            # 바이낸스 선물 테이커 0.05% (편도)
 SLIPPAGE = 0.0001
-MAX_HOLD_MIN = 180
+MAX_HOLD_MIN = 240           # 4시간 지나도 +0.5R 미만이면 시간 청산
 MIN_NOTIONAL = 100
-BE_BUFFER = 0.0012
-MAX_NOTIONAL_USD = float(os.getenv("MAX_NOTIONAL_USD", "200"))  # 0 이면 해제 (검증 후 상향)
+BE_BUFFER = 0.0012           # 본전 스탑 = 진입가 + 0.12% (수수료 커버)
  
-# ---- LLM 비용 통제 ----
+# 시험용 상한: 한 번에 최대 이 금액(USDT)까지만 진입. 0 이면 해제. (v1의 200 상한 유지)
+MAX_NOTIONAL_USD = float(os.getenv("MAX_NOTIONAL_USD", "200"))
+ 
 USE_LLM = os.getenv("USE_LLM", "1") == "1"
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-LLM_SKIP_SCORE = 70          # 이 점수 이상은 LLM 없이 바로 진입 (비용 0)
-LLM_MAX_CALLS_PER_DAY = 25   # 하루 호출 상한
-LLM_CACHE_SEC = 1800
-NEWS_TTL_SEC = 3600
+NEWS_TTL_SEC = 1800
  
 # ===================== 거래소 =====================
 exchange = ccxt.binance({
@@ -80,8 +74,6 @@ exchange = ccxt.binance({
         'defaultType': 'future',
         'portfolioMargin': True,
         'fetchCurrencies': False,
-        'adjustForTimeDifference': True,
-        'recvWindow': 10000,
     },
 })
 serp_api_key = os.getenv("SERP_API_KEY")
@@ -110,6 +102,7 @@ def setup_database():
         position_size_percentage REAL NOT NULL, investment_amount REAL NOT NULL,
         status TEXT DEFAULT 'OPEN', exit_price REAL, exit_timestamp TEXT,
         profit_loss REAL, profit_loss_percentage REAL)''')
+    # v2 확장 컬럼 (기존 DB 호환 마이그레이션)
     for col, typ in [("strategy", "TEXT"), ("score", "REAL"), ("sl_order_id", "TEXT"),
                      ("tp_order_id", "TEXT"), ("risk_amount", "REAL"), ("fees", "REAL"),
                      ("r_multiple", "REAL")]:
@@ -120,10 +113,9 @@ def setup_database():
     c.execute('''CREATE TABLE IF NOT EXISTS signals (
         id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
         strategy TEXT, side TEXT, score REAL, price REAL, taken INTEGER DEFAULT 0, note TEXT)''')
-    c.execute("CREATE TABLE IF NOT EXISTS llm_calls (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL)")
     conn.commit()
     conn.close()
-    print("데이터베이스 설정 완료:", DB_FILE)
+    print("데이터베이스 설정 완료")
  
  
 def save_signal(sig, taken, note=""):
@@ -167,6 +159,7 @@ def get_latest_open_trade():
  
  
 def risk_gate(equity):
+    """일일 손실/거래수/연속손실 게이트. (통과여부, 사유)"""
     today = datetime.now().strftime('%Y-%m-%d')
     conn = db()
     row = conn.execute("SELECT COALESCE(SUM(profit_loss),0) s FROM trades WHERE status='CLOSED' "
@@ -189,6 +182,7 @@ def risk_gate(equity):
  
  
 def strategy_stats(last_n=20):
+    """전략별 최근 성과 (적응형 점수 보정 + LLM 컨텍스트용)"""
     conn = db()
     rows = conn.execute("SELECT strategy, r_multiple, profit_loss FROM trades WHERE status='CLOSED' "
                         "AND strategy IS NOT NULL ORDER BY exit_timestamp DESC LIMIT 200").fetchall()
@@ -200,9 +194,8 @@ def strategy_stats(last_n=20):
             s.append((r['r_multiple'], (r['profit_loss'] or 0) > 0))
     out = {}
     for k, v in stats.items():
-        if v:
-            out[k] = {"n": len(v), "avg_R": round(sum(x[0] for x in v) / len(v), 2),
-                      "win_rate": round(sum(1 for x in v if x[1]) / len(v) * 100, 1)}
+        out[k] = {"n": len(v), "avg_R": round(sum(x[0] for x in v) / len(v), 2),
+                  "win_rate": round(sum(1 for x in v if x[1]) / len(v) * 100, 1)}
     return out
  
  
@@ -214,25 +207,8 @@ def print_summary(days=7):
         WHERE status='CLOSED' AND exit_timestamp>=?""", (cutoff,)).fetchone()
     conn.close()
     if r['n']:
-        print(f"[{days}일 요약] 거래 {r['n']}건 (하루 평균 {r['n'] / days:.1f}건) | 승률 {r['w'] / r['n'] * 100:.1f}% | "
+        print(f"[{days}일 요약] 거래 {r['n']}건 | 승률 {r['w'] / r['n'] * 100:.1f}% | "
               f"손익 {r['pnl']:+.2f} USDT | 평균 {r['r']:+.2f}R")
- 
- 
-def hours_since_last_entry():
-    conn = db()
-    r = conn.execute("SELECT MAX(timestamp) t FROM trades WHERE strategy != 'adopted'").fetchone()
-    conn.close()
-    if not r or not r['t']:
-        return 999.0
-    return (datetime.now() - datetime.fromisoformat(r['t'])).total_seconds() / 3600
- 
- 
-def llm_calls_today():
-    today = datetime.now().strftime('%Y-%m-%d')
-    conn = db()
-    n = conn.execute("SELECT COUNT(*) n FROM llm_calls WHERE substr(ts,1,10)=?", (today,)).fetchone()['n']
-    conn.close()
-    return n
  
  
 # ===================== 지표 =====================
@@ -290,17 +266,17 @@ def _mk(strategy, side, score, price, sl_dist, atr, rr=None, tp_dist=None, min_r
     real_rr = tp_dist / sl_dist
     if real_rr < min_rr or tp_dist / price < MIN_TP_PCT:
         return None
-    if funding is not None:
+    if funding is not None:  # 군중 쏠림 반대 방향 가점/감점
         if side == 'long' and funding > 0.0005:
-            score -= 6
+            score -= 8
         if side == 'short' and funding < -0.0005:
-            score -= 6
+            score -= 8
     return {"strategy": strategy, "side": side, "score": int(min(score, 95)), "entry": price,
             "sl_dist": sl_dist, "tp_dist": tp_dist, "rr": round(real_rr, 2), "reasons": reasons or []}
  
  
 def evaluate(d, h1, h4, funding=None):
-    """d: 진입TF(지표 포함, 마지막=직전 마감봉), h1/h4: 상위 TF 마지막 마감봉(Series)"""
+    """d: 15분봉(지표 포함, 마지막=직전 마감봉), h1/h4: 상위 TF 마지막 마감봉(Series)"""
     if len(d) < 12:
         return []
     c, p = d.iloc[-1], d.iloc[-2]
@@ -318,12 +294,12 @@ def evaluate(d, h1, h4, funding=None):
             if side == 'long':
                 touched = (rec5['low'] <= rec5['ema20'] * 1.0005).any()
                 ok = (touched and c['close'] > c['ema20'] and c['close'] > c['open'] and c['close'] > c['ema50']
-                      and 40 <= c['rsi'] <= 68 and c['macd_h'] > p['macd_h'])
+                      and 42 <= c['rsi'] <= 65 and c['macd_h'] > p['macd_h'])
                 sl_dist = price - (rec8['low'].min() - 0.2 * atr)
             else:
                 touched = (rec5['high'] >= rec5['ema20'] * 0.9995).any()
                 ok = (touched and c['close'] < c['ema20'] and c['close'] < c['open'] and c['close'] < c['ema50']
-                      and 32 <= c['rsi'] <= 60 and c['macd_h'] < p['macd_h'])
+                      and 35 <= c['rsi'] <= 58 and c['macd_h'] < p['macd_h'])
                 sl_dist = (rec8['high'].max() + 0.2 * atr) - price
             if ok:
                 score = (58 + (10 if b4 == sgn else 0) + (8 if adx1 > 25 else 0) + (6 if c['vol_z'] > 0.3 else 0)
@@ -333,14 +309,14 @@ def evaluate(d, h1, h4, funding=None):
                 if s:
                     sigs.append(s)
  
-        # ---- B. 돌파 ----
-        if b1 in (0, sgn) and b4 in (0, sgn) and c['vol_z'] > 0.6 and c['adx'] > 16:
+        # ---- B. 돌파 (볼린저 스퀴즈 가점) ----
+        if b1 in (0, sgn) and b4 in (0, sgn) and c['vol_z'] > 1.0 and c['adx'] > 18:
             if side == 'long':
                 brk = c['close'] > c['don_hi'] and c['close'] > c['open'] and (c['close'] - c['ema20']) < 2.5 * atr
             else:
                 brk = c['close'] < c['don_lo'] and c['close'] < c['open'] and (c['ema20'] - c['close']) < 2.5 * atr
             if brk:
-                score = (56 + (10 if d['bb_squeeze'].iloc[-10:].any() else 0) + (8 if (b1 == sgn and b4 == sgn) else 0)
+                score = (57 + (10 if d['bb_squeeze'].iloc[-10:].any() else 0) + (8 if (b1 == sgn and b4 == sgn) else 0)
                          + (6 if c['vol_z'] > 2 else 0) + (5 if c['adx'] > p['adx'] else 0))
                 s = _mk("breakout", side, score, price, 1.5 * atr, atr, rr=2.0, funding=funding,
                         reasons=["20봉 돌파", f"거래량 z={c['vol_z']:.1f}"])
@@ -348,42 +324,24 @@ def evaluate(d, h1, h4, funding=None):
                     sigs.append(s)
  
         # ---- C. 횡보 평균회귀 ----
-        if adx1 < 24 and (b4 in (0, sgn) or adx1 < 18):
+        if adx1 < 22 and (b4 in (0, sgn) or adx1 < 18):
             if side == 'long':
                 ok = (p['low'] < p['bb_lo'] and c['close'] > c['bb_lo'] and c['close'] > c['open']
-                      and p['rsi'] < 38 and c['rsi'] > p['rsi'])
+                      and p['rsi'] < 35 and c['rsi'] > p['rsi'])
                 sl_dist = price - (min(p['low'], c['low']) - 0.3 * atr)
                 tp_dist = c['bb_mid'] - price
                 extreme = p['rsi'] < 28
             else:
                 ok = (p['high'] > p['bb_up'] and c['close'] < c['bb_up'] and c['close'] < c['open']
-                      and p['rsi'] > 62 and c['rsi'] < p['rsi'])
+                      and p['rsi'] > 65 and c['rsi'] < p['rsi'])
                 sl_dist = (max(p['high'], c['high']) + 0.3 * atr) - price
                 tp_dist = price - c['bb_mid']
                 extreme = p['rsi'] > 72
             if ok and tp_dist > 0:
-                score = 55 + (8 if extreme else 0) + (8 if c['vol_z'] > 0.5 else 0) + (6 if adx1 < 18 else 0) \
+                score = 56 + (8 if extreme else 0) + (8 if c['vol_z'] > 0.5 else 0) + (6 if adx1 < 18 else 0) \
                         + (5 if b4 == sgn else 0)
                 s = _mk("mean_reversion", side, score, price, max(sl_dist, 1.0 * atr), atr, tp_dist=tp_dist,
-                        min_rr=1.2, funding=funding, reasons=["볼린저 밴드 이탈 후 복귀", f"1h ADX={adx1:.0f}(횡보)"])
-                if s:
-                    sigs.append(s)
- 
-        # ---- D. 모멘텀 지속 (신규: 추세 중 직전봉 고/저 돌파) ----
-        if b1 == sgn and b4 in (0, sgn) and c['adx'] > 20:
-            if side == 'long':
-                ok = (c['close'] > c['ema20'] > c['ema50'] and c['macd_h'] > 0 and c['macd_h'] > p['macd_h']
-                      and 50 <= c['rsi'] <= 70 and c['close'] > p['high'] and (c['close'] - c['ema20']) < 1.5 * atr)
-                sl_dist = price - d.iloc[-4:]['low'].min()
-            else:
-                ok = (c['close'] < c['ema20'] < c['ema50'] and c['macd_h'] < 0 and c['macd_h'] < p['macd_h']
-                      and 30 <= c['rsi'] <= 50 and c['close'] < p['low'] and (c['ema20'] - c['close']) < 1.5 * atr)
-                sl_dist = d.iloc[-4:]['high'].max() - price
-            if ok:
-                score = 55 + (10 if b4 == sgn else 0) + (6 if adx1 > 25 else 0) + (5 if c['vol_z'] > 0.5 else 0) \
-                        + (4 if c['adx'] > p['adx'] else 0)
-                s = _mk("momentum", side, score, price, max(sl_dist, 1.2 * atr), atr, rr=1.8, funding=funding,
-                        reasons=[f"추세 {b1}/{b4}", "직전봉 고/저 돌파 모멘텀"])
+                        min_rr=1.3, funding=funding, reasons=["볼린저 밴드 이탈 후 복귀", f"1h ADX={adx1:.0f}(횡보)"])
                 if s:
                     sigs.append(s)
  
@@ -393,6 +351,7 @@ def evaluate(d, h1, h4, funding=None):
  
 # ===================== 포지션 사이징 =====================
 def calc_position(equity, entry, sl_dist, size_mult=1.0, notional_cap=None):
+    """고정 위험 사이징: SL 맞으면 (자본 x RISK_PER_TRADE x size_mult) 만 손실."""
     risk_amt = equity * RISK_PER_TRADE * size_mult
     notional = (risk_amt / sl_dist) * entry
     cap = equity * MAX_LEVERAGE * 0.9
@@ -400,6 +359,7 @@ def calc_position(equity, entry, sl_dist, size_mult=1.0, notional_cap=None):
         cap = min(cap, notional_cap)
     notional = min(notional, cap)
     if notional < MIN_NOTIONAL:
+        # 최소주문금액으로 올려도 위험이 목표의 2배 이내일 때만 허용 (v1처럼 무조건 상향 X)
         if MIN_NOTIONAL <= cap and MIN_NOTIONAL * sl_dist / entry <= risk_amt * 2:
             notional = MIN_NOTIONAL
         else:
@@ -416,14 +376,6 @@ def calc_position(equity, entry, sl_dist, size_mult=1.0, notional_cap=None):
  
 # ===================== 거래소 헬퍼 =====================
 def get_equity():
-    """PM(포트폴리오 마진) 계정은 papi 계정 정보의 equity가 가장 정확함. 실패 시 잔고 조회로 폴백"""
-    try:
-        acc = exchange.papiGetAccount()
-        v = float(acc.get('actualEquity') or acc.get('accountEquity') or 0)
-        if v > 0:
-            return v
-    except Exception as e:
-        print("papi 자본 조회 실패, 잔고로 대체:", e)
     bal = exchange.fetch_balance()
     for key in ('total', 'free'):
         part = bal.get(key, {}) or {}
@@ -461,6 +413,7 @@ def cancel_all_orders():
  
  
 def place_protection(side, qty, entry, sl_dist, tp_dist):
+    """SL/TP 주문 설정. side = 포지션 방향('long'/'short')"""
     close_side = 'sell' if side == 'long' else 'buy'
     dirn = 1 if side == 'long' else -1
     sl, tp = px(entry - dirn * sl_dist), px(entry + dirn * tp_dist)
@@ -476,18 +429,9 @@ def close_market(side, qty):
  
  
 def open_with_protection(side, qty, entry_hint, sl_dist, tp_dist):
-    """시장가 진입 -> 실제 평단 재조회 -> SL/TP 설정. 실패 시 즉시 청산 + ProtectionError."""
+    """시장가 진입 후 SL/TP 설정. 실패 시 즉시 청산 + ProtectionError."""
     order = exchange.create_order(SYMBOL, 'market', 'buy' if side == 'long' else 'sell', qty)
-    entry = float(order.get('average') or 0)
-    if entry <= 0:
-        time.sleep(1)
-        try:
-            _, _, ep = get_position()
-            entry = ep
-        except Exception:
-            entry = 0
-    if entry <= 0:
-        entry = float(order.get('price') or entry_hint)
+    entry = float(order.get('average') or order.get('price') or entry_hint)
     try:
         sl, tp, sl_id, tp_id = place_protection(side, qty, entry, sl_dist, tp_dist)
     except Exception as e:
@@ -512,18 +456,17 @@ def load_features():
         o = exchange.fetch_ohlcv(SYMBOL, timeframe=tf, limit=limit)
         df = pd.DataFrame(o, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df.iloc[:-1].reset_index(drop=True)
+        return df.iloc[:-1].reset_index(drop=True)  # 형성 중인 마지막 캔들 제외
  
-    d = add_indicators(get(ENTRY_TF, 300))
+    d15 = add_indicators(get('15m', 300))
     h1 = add_indicators(get('1h', 300))
     h4 = add_indicators(get('4h', 300))
-    return d, h1.iloc[-1], h4.iloc[-1]
+    return d15, h1.iloc[-1], h4.iloc[-1]
  
  
-# ===================== AI 필터 (저비용) =====================
+# ===================== AI 필터 =====================
 _client = None
 _news_cache = (0, [])
-_llm_cache = {}
  
  
 def fetch_news():
@@ -535,7 +478,8 @@ def fetch_news():
         r = requests.get("https://serpapi.com/search.json", timeout=10, params={
             "engine": "google_news", "q": "bitcoin", "gl": "us", "hl": "en", "api_key": serp_api_key})
         if r.status_code == 200:
-            items = [n.get("title", "")[:100] for n in r.json().get("news_results", [])[:5]]
+            items = [{"title": n.get("title", ""), "date": n.get("date", "")}
+                     for n in r.json().get("news_results", [])[:8]]
     except Exception as e:
         print("뉴스 수집 오류:", e)
     _news_cache = (time.time(), items)
@@ -543,7 +487,7 @@ def fetch_news():
  
  
 def llm_review(sig, d, h1, h4):
-    """승인/거부 + 사이즈 배수. 실패 시 None. 입력은 요약 지표만(약 400토큰)."""
+    """신호 승인/거부 + 사이즈 배수. 실패 시 None."""
     global _client
     try:
         if _client is None:
@@ -553,27 +497,25 @@ def llm_review(sig, d, h1, h4):
         payload = {
             "signal": {k: sig[k] for k in ("strategy", "side", "score", "rr", "reasons")},
             "price": round(float(c['close']), 1),
-            f"{ENTRY_TF}": {k: round(float(c[k]), 2) for k in ("rsi", "adx", "vol_z")},
-            "1h": {"rsi": round(float(h1['rsi']), 1), "adx": round(float(h1['adx']), 1),
-                   "trend": bias(h1, 'ema20', 'ema50')},
-            "4h": {"rsi": round(float(h4['rsi']), 1), "trend": bias(h4, 'ema50', 'ema200')},
+            "15m": {k: round(float(c[k]), 2) for k in ("rsi", "adx", "atr", "vol_z", "macd_h")},
+            "1h": {k: round(float(h1[k]), 2) for k in ("rsi", "adx")} | {"trend": bias(h1, 'ema20', 'ema50')},
+            "4h": {k: round(float(h4[k]), 2) for k in ("rsi", "adx")} | {"trend": bias(h4, 'ema50', 'ema200')},
+            "last_6_candles_15m": d.tail(6)[['open', 'high', 'low', 'close']].round(1).values.tolist(),
             "news": fetch_news(),
-            "strategy_recent_perf": strategy_stats().get(sig['strategy']),
+            "strategy_recent_perf": strategy_stats(),
         }
         sys_prompt = (
-            "Risk reviewer for a BTC futures bot. A rule engine found a setup. DEFAULT APPROVE. "
-            "VETO only for concrete evidence: major news opposing the side, clear higher-timeframe conflict, "
-            "or this strategy's recent performance clearly poor. size_multiplier 0.5-1.0. "
-            'Reply ONLY JSON: {"verdict":"APPROVE"|"VETO","size_multiplier":0.5-1.0,"reason":"<=120 chars"}')
+            "You are a risk reviewer for an automated BTC futures bot. A rule-based engine already found a valid "
+            "setup. DEFAULT TO APPROVE. VETO only with concrete evidence: a major negative/positive news event "
+            "opposing the side, or strong conflict with higher-timeframe structure, or this strategy's recent "
+            "performance is clearly poor. Do not veto out of generic caution. size_multiplier in [0.5,1.0]: "
+            "1.0 for clean setups, lower when uncertain. Reply ONLY JSON: "
+            '{"verdict":"APPROVE"|"VETO","size_multiplier":0.5-1.0,"reason":"<=200 chars"}')
         r = _client.chat.completions.create(
-            model=LLM_MODEL, max_tokens=100, temperature=0.2,
+            model=LLM_MODEL, max_tokens=150, temperature=0.2,
             response_format={"type": "json_object"},
             messages=[{"role": "system", "content": sys_prompt},
                       {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}])
-        conn = db()
-        conn.execute("INSERT INTO llm_calls (ts) VALUES (?)", (datetime.now().isoformat(),))
-        conn.commit()
-        conn.close()
         out = json.loads(r.choices[0].message.content)
         out["size_multiplier"] = min(1.0, max(0.5, float(out.get("size_multiplier", 1.0))))
         out["verdict"] = "VETO" if str(out.get("verdict", "")).upper() == "VETO" else "APPROVE"
@@ -583,27 +525,9 @@ def llm_review(sig, d, h1, h4):
         return None
  
  
-def ai_decision(sig, d, h1, h4):
-    """(진입여부, 사이즈배수, 메모). 호출 최소화 규칙 적용"""
-    if not USE_LLM or sig['score'] >= LLM_SKIP_SCORE:
-        return True, 1.0, "LLM 생략(고점수/비활성)"
-    key = (sig['strategy'], sig['side'])
-    cached = _llm_cache.get(key)
-    if cached and time.time() - cached[0] < LLM_CACHE_SEC:
-        v = cached[1]
-        return v['verdict'] == 'APPROVE', v['size_multiplier'], "캐시: " + str(v.get('reason', ''))
-    if llm_calls_today() >= LLM_MAX_CALLS_PER_DAY:
-        return True, 0.7, "LLM 일일 상한 도달 -> 0.7배 사이즈"
-    rv = llm_review(sig, d, h1, h4)
-    if rv is None:
-        return True, 0.5, "LLM 실패 -> 절반 사이즈"
-    _llm_cache[key] = (time.time(), rv)
-    return rv['verdict'] == 'APPROVE', rv['size_multiplier'], str(rv.get('reason', ''))
- 
- 
 # ===================== 포지션 관리 =====================
 def finalize_closed_trade(trade):
-    time.sleep(4)  # 청산 체결 내역 반영 대기
+    """포지션이 사라졌을 때 실제 체결 내역으로 손익 확정 (불가하면 추정)"""
     entry, amt = trade['entry_price'], trade['amount']
     dirn = 1 if trade['action'] == 'long' else -1
     since = int(datetime.fromisoformat(trade['timestamp']).timestamp() * 1000) - 5000
@@ -637,42 +561,22 @@ def finalize_closed_trade(trade):
  
  
 def replace_stop(trade, side, amt, new_sl):
-    """1차: 새 스탑 먼저 생성 후 기존 취소. 거래소가 거부하면 2차: 기존 취소 후 생성(실패 시 원복/시장가 청산)"""
+    """새 스탑을 먼저 만들고 성공하면 기존 스탑 취소 (보호 공백 방지)"""
     close_side = 'sell' if side == 'long' else 'buy'
     new_sl = px(new_sl)
-    old_id, old_sl = trade.get('sl_order_id'), trade['sl_price']
-    new_order = None
     try:
-        new_order = exchange.create_order(SYMBOL, 'STOP_MARKET', close_side, amt, None,
-                                          {'stopPrice': new_sl, 'reduceOnly': True})
-        if old_id:
-            try:
-                exchange.cancel_order(old_id, SYMBOL, params={'stop': True})
-            except Exception as e:
-                print("기존 스탑 취소 오류(무시):", e)
-    except Exception as e1:
-        print("스탑 선생성 실패, 취소 후 재생성 시도:", e1)
+        o = exchange.create_order(SYMBOL, 'STOP_MARKET', close_side, amt, None,
+                                  {'stopPrice': new_sl, 'reduceOnly': True})
+    except Exception as e:
+        print("스탑 이동 실패(기존 스탑 유지):", e)
+        return
+    if trade.get('sl_order_id'):
         try:
-            if old_id:
-                exchange.cancel_order(old_id, SYMBOL, params={'stop': True})
-            new_order = exchange.create_order(SYMBOL, 'STOP_MARKET', close_side, amt, None,
-                                              {'stopPrice': new_sl, 'reduceOnly': True})
-        except Exception as e2:
-            print("스탑 이동 최종 실패, 기존 스탑 원복 시도:", e2)
-            try:
-                new_order = exchange.create_order(SYMBOL, 'STOP_MARKET', close_side, amt, None,
-                                                  {'stopPrice': px(old_sl), 'reduceOnly': True})
-                new_sl = px(old_sl)
-            except Exception as e3:
-                print("!!! 스탑 원복도 실패 -> 보호 공백 방지를 위해 시장가 청산:", e3)
-                try:
-                    close_market(side, amt)
-                except Exception as e4:
-                    print("!!! 청산 실패. 바이낸스 앱에서 직접 확인하세요:", e4)
-                return
-    if new_order:
-        db_update(trade['id'], {'sl_price': new_sl, 'sl_order_id': new_order.get('id')})
-        print(f"스탑 이동 -> {new_sl:,.1f}")
+            exchange.cancel_order(trade['sl_order_id'], SYMBOL, params={'stop': True})
+        except Exception as e:
+            print("기존 스탑 취소 오류(무시):", e)
+    db_update(trade['id'], {'sl_price': new_sl, 'sl_order_id': o.get('id')})
+    print(f"스탑 이동 -> {new_sl:,.1f}")
  
  
 def manage_position(trade, side, amt):
@@ -693,9 +597,9 @@ def manage_position(trade, side, amt):
  
     new_sl = None
     if r_now >= 1.0:
-        new_sl = entry + dirn * entry * BE_BUFFER
+        new_sl = entry + dirn * entry * BE_BUFFER          # 본전 스탑
     if r_now >= 1.5:
-        trail = price - dirn * 0.8 * r_dist
+        trail = price - dirn * 0.8 * r_dist                  # 트레일링
         if new_sl is None or (trail - new_sl) * dirn > 0:
             new_sl = trail
     if new_sl is not None and (new_sl - trade['sl_price']) * dirn > 0.1 * r_dist:
@@ -703,8 +607,9 @@ def manage_position(trade, side, amt):
  
  
 def adopt_orphan(side, amt, entry):
-    d, _, _ = load_features()
-    atr = float(d.iloc[-1]['atr'])
+    """DB에 없는 기존 포지션 편입 + 보호주문 없으면 설정"""
+    d15, _, _ = load_features()
+    atr = float(d15.iloc[-1]['atr'])
     sl_dist = max(1.5 * atr, entry * 0.004)
     tp_dist = 2 * sl_dist
     cond = []
@@ -726,37 +631,26 @@ def adopt_orphan(side, amt, entry):
  
  
 # ===================== 신호 사이클 =====================
-def effective_min_score():
-    """무거래가 길어지면 최대 RELAX_FLOOR점까지만 단계 완화 (4시간마다 3점씩)"""
-    h = hours_since_last_entry()
-    relax = 0
-    if h >= 4:
-        relax = 3
-    if h >= 8:
-        relax = RELAX_FLOOR
-    return MIN_SCORE - relax, relax
- 
- 
 def run_signal_cycle(dry=False):
     equity = get_equity()
     ok, reason = risk_gate(equity)
     if not ok:
         print("[게이트]", reason)
         return
-    d, h1, h4 = load_features()
-    sigs = evaluate(d, h1, h4, get_funding())
+    d15, h1, h4 = load_features()
+    sigs = evaluate(d15, h1, h4, get_funding())
  
+    # 적응형 점수 보정: 최근 기대값이 나쁜 전략은 감점, 좋은 전략은 가점
     stats = strategy_stats()
     for s in sigs:
         st = stats.get(s['strategy'])
         if st and st['n'] >= 8:
             s['score'] += int(max(-10, min(5, st['avg_R'] * 10)))
-    min_score, relax = effective_min_score()
-    sigs = sorted([s for s in sigs if s['score'] >= min_score], key=lambda x: x['score'], reverse=True)
+    sigs = sorted([s for s in sigs if s['score'] >= MIN_SCORE], key=lambda x: x['score'], reverse=True)
  
-    price = float(d.iloc[-1]['close'])
+    price = float(d15.iloc[-1]['close'])
     if not sigs:
-        print(f"[{datetime.now():%H:%M}] {price:,.1f} | 신호 없음 (하한 {min_score}{f', 완화 -{relax}' if relax else ''})")
+        print(f"[{datetime.now():%H:%M}] {price:,.1f} | 신호 없음")
         return
     sig = sigs[0]
     print(f"[{datetime.now():%H:%M}] 신호: {sig['strategy']} {sig['side'].upper()} 점수 {sig['score']} "
@@ -766,12 +660,21 @@ def run_signal_cycle(dry=False):
         save_signal(sig, False, "dry-run")
         return
  
-    go, size_mult, note = ai_decision(sig, d, h1, h4)
-    if not go:
-        print("AI 거부:", note)
-        save_signal(sig, False, "VETO: " + note)
-        return
-    print(f"진입 승인 (x{size_mult:.2f}): {note}")
+    size_mult, note = 1.0, ""
+    if USE_LLM:
+        rv = llm_review(sig, d15, h1, h4)
+        if rv is None:
+            if sig['score'] < 75:
+                save_signal(sig, False, "LLM 실패 + 점수 미달")
+                return
+            size_mult, note = 0.5, "LLM 실패, 절반 사이즈"
+        elif rv['verdict'] == 'VETO':
+            print("AI 거부:", rv.get('reason'))
+            save_signal(sig, False, "VETO: " + str(rv.get('reason')))
+            return
+        else:
+            size_mult, note = rv['size_multiplier'], str(rv.get('reason', ''))
+            print(f"AI 승인 (x{size_mult:.2f}): {note}")
  
     pos = calc_position(equity, sig['entry'], sig['sl_dist'], size_mult, MAX_NOTIONAL_USD or None)
     if not pos:
@@ -800,12 +703,10 @@ def run_signal_cycle(dry=False):
  
 # ===================== 메인 루프 =====================
 def main_live(dry=False):
-    print("\n=== Bitcoin Bot v3 시작 ===", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-    print(f"모드: {'DRY-RUN(주문 없음)' if dry else '실거래'} | 진입TF {ENTRY_TF} | "
-          f"AI필터: {LLM_MODEL if USE_LLM else 'OFF'}(경계 점수만, 일 {LLM_MAX_CALLS_PER_DAY}회 상한) | "
-          f"위험/거래 {RISK_PER_TRADE * 100:.2f}% | 최대 {MAX_LEVERAGE}x | 최소점수 {MIN_SCORE}")
+    print("\n=== Bitcoin Bot v2 시작 ===", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    print(f"모드: {'DRY-RUN(주문 없음)' if dry else '실거래'} | AI필터: {LLM_MODEL if USE_LLM else 'OFF'} "
+          f"| 위험/거래 {RISK_PER_TRADE * 100:.2f}% | 최대 {MAX_LEVERAGE}x | 최소점수 {MIN_SCORE}")
     setup_database()
-    period = TF_MIN * 60
     last_bucket = None
     while True:
         try:
@@ -820,7 +721,7 @@ def main_live(dry=False):
                 time.sleep(10)
                 continue
  
-            if trade:
+            if trade:  # 포지션 없음 + DB엔 열림 -> 종료됨 (진입 직후 반영 지연 방지)
                 age = (datetime.now() - datetime.fromisoformat(trade['timestamp'])).total_seconds()
                 if age < 20:
                     time.sleep(3)
@@ -829,13 +730,13 @@ def main_live(dry=False):
                 cancel_all_orders()
  
             now = time.time()
-            bucket = int(now // period)
-            if bucket == last_bucket or now % period < 5:   # 봉 마감 5초 후 1회만 평가
-                time.sleep(3)
+            bucket = int(now // 900)
+            if bucket == last_bucket or now % 900 < 5:   # 15분봉 마감 5초 후 1회만 평가
+                time.sleep(5)
                 continue
             last_bucket = bucket
             run_signal_cycle(dry)
-            time.sleep(3)
+            time.sleep(5)
         except KeyboardInterrupt:
             print("종료")
             break
@@ -864,21 +765,18 @@ def fetch_history(tf, since_ms):
     return df.iloc[:-1]
  
  
-def simulate(df, h1, h4, equity0=1000.0, warmup=120, verbose=True, min_score=None, tf_min=None):
-    """진입TF 봉 마감 신호 -> 다음 봉 시가 진입. SL/TP 동시 터치 시 SL 우선(보수적)."""
-    min_score = MIN_SCORE if min_score is None else min_score
-    tf_min = TF_MIN if tf_min is None else tf_min
-    ct = (df['timestamp'] + pd.Timedelta(minutes=tf_min)).values
+def simulate(df15, h1, h4, equity0=1000.0, warmup=120, verbose=True):
+    """15분봉 마감 신호 -> 다음 봉 시가 진입. SL/TP 동시 터치 시 SL 우선(보수적)."""
+    ct15 = (df15['timestamp'] + pd.Timedelta(minutes=15)).values
     ct1 = (h1['timestamp'] + pd.Timedelta(hours=1)).values
     ct4 = (h4['timestamp'] + pd.Timedelta(hours=4)).values
     eq, peak, mdd = equity0, equity0, 0.0
     trades, pos, pending = [], None, None
     cur_day, day_start, day_n, halted, consec, cool_until = None, eq, 0, False, 0, -1
-    hold_bars = MAX_HOLD_MIN // tf_min
-    cool_bars = COOLDOWN_MIN // tf_min
+    hold_bars = MAX_HOLD_MIN // 15
  
-    for i in range(warmup, len(df)):
-        bar = df.iloc[i]
+    for i in range(warmup, len(df15)):
+        bar = df15.iloc[i]
         day = bar['timestamp'].date()
         if day != cur_day:
             cur_day, day_start, day_n, halted = day, eq, 0, False
@@ -922,72 +820,61 @@ def simulate(df, h1, h4, equity0=1000.0, warmup=120, verbose=True, min_score=Non
                                "bars": i - pos['open_i'], "day": day})
                 consec = consec + 1 if pnl < 0 else 0
                 if consec >= MAX_CONSEC_LOSSES:
-                    cool_until, consec = i + cool_bars, 0
+                    cool_until, consec = i + COOLDOWN_MIN // 15, 0
                 pos = None
                 peak = max(peak, eq)
                 mdd = max(mdd, (peak - eq) / peak)
                 if eq - day_start <= -DAILY_LOSS_LIMIT * day_start:
                     halted = True
  
-        if pos is None and not halted and day_n < MAX_TRADES_PER_DAY and i >= cool_until and i < len(df) - 1:
-            j1 = np.searchsorted(ct1, ct[i], side='right') - 1
-            j4 = np.searchsorted(ct4, ct[i], side='right') - 1
+        if pos is None and not halted and day_n < MAX_TRADES_PER_DAY and i >= cool_until and i < len(df15) - 1:
+            j1 = np.searchsorted(ct1, ct15[i], side='right') - 1
+            j4 = np.searchsorted(ct4, ct15[i], side='right') - 1
             if j1 >= 0 and j4 >= 0:
-                sigs = [s for s in evaluate(df.iloc[i - 29:i + 1], h1.iloc[j1], h4.iloc[j4])
-                        if s['score'] >= min_score]
+                sigs = [s for s in evaluate(df15.iloc[i - 29:i + 1], h1.iloc[j1], h4.iloc[j4])
+                        if s['score'] >= MIN_SCORE]
                 if sigs:
                     pending = sigs[0]
  
     n = len(trades)
-    span = max(1, (df['timestamp'].iloc[-1] - df['timestamp'].iloc[warmup]).days)
-    res = {"min_score": min_score, "trades": n, "trades_per_day": n / span, "final_equity": eq,
-           "return_pct": (eq / equity0 - 1) * 100, "max_dd_pct": mdd * 100,
-           "win_rate": 0.0, "avg_R": 0.0, "profit_factor": 0.0}
+    res = {"trades": n, "final_equity": eq, "return_pct": (eq / equity0 - 1) * 100, "max_dd_pct": mdd * 100}
     if n:
         wins = [t for t in trades if t['pnl'] > 0]
         gp, gl = sum(t['pnl'] for t in wins), -sum(t['pnl'] for t in trades if t['pnl'] <= 0)
-        res.update({"win_rate": len(wins) / n * 100, "avg_R": float(np.mean([t['R'] for t in trades])),
+        days = max(1, len({t['day'] for t in trades}))
+        span = max(1, (df15['timestamp'].iloc[-1] - df15['timestamp'].iloc[warmup]).days)
+        res.update({"trades_per_day": n / span, "win_rate": len(wins) / n * 100,
+                    "avg_R": float(np.mean([t['R'] for t in trades])),
                     "profit_factor": gp / gl if gl > 0 else float('inf')})
         if verbose:
             by = {}
             for t in trades:
                 by.setdefault(t['strategy'], []).append(t['R'])
-            res["by_strategy(건수,평균R)"] = {k: (len(v), round(float(np.mean(v)), 2)) for k, v in by.items()}
+            res["by_strategy"] = {k: (len(v), round(float(np.mean(v)), 2)) for k, v in by.items()}
     if verbose:
         print("\n===== 백테스트 결과 (수수료·슬리피지 포함) =====")
         for k, v in res.items():
-            print(f"{k:>22}: {v:.2f}" if isinstance(v, float) else f"{k:>22}: {v}")
+            print(f"{k:>16}: {v:.2f}" if isinstance(v, float) else f"{k:>16}: {v}")
         print("※ 과거 성과는 미래를 보장하지 않습니다. 파라미터를 과최적화하지 마세요.")
     return res
  
  
-def run_backtest(days, sweep=False):
+def run_backtest(days):
     now_ms = exchange.milliseconds()
     day_ms = 86400000
-    print(f"데이터 수집 중... ({days}일, 진입TF {ENTRY_TF})")
-    d = add_indicators(fetch_history(ENTRY_TF, now_ms - (days + 3) * day_ms)).reset_index(drop=True)
-    h1 = add_indicators(fetch_history('1h', now_ms - (days + 15) * day_ms)).reset_index(drop=True)
-    h4 = add_indicators(fetch_history('4h', now_ms - (days + 60) * day_ms)).reset_index(drop=True)
-    if not sweep:
-        simulate(d, h1, h4)
-        return
-    print("\n점수 하한별 비교 (하루 거래수 / 수수료 후 성과)")
-    print(f"{'점수':>5} {'거래':>5} {'일평균':>6} {'승률%':>6} {'평균R':>6} {'PF':>5} {'수익%':>7} {'MDD%':>6}")
-    for ms in (50, 52, 55, 58, 62, 66, 70):
-        r = simulate(d, h1, h4, verbose=False, min_score=ms)
-        print(f"{ms:>5} {r['trades']:>5} {r['trades_per_day']:>6.1f} {r['win_rate']:>6.1f} {r['avg_R']:>6.2f} "
-              f"{r['profit_factor']:>5.2f} {r['return_pct']:>7.2f} {r['max_dd_pct']:>6.2f}")
-    print(f"\n선택 기준: 일평균 거래 >= {TARGET_TRADES_PER_DAY} 이면서 PF >= 1.2, 평균R > 0 인 가장 높은 점수를 "
-          f"MIN_SCORE 로 설정하세요. 그런 행이 없으면 거래 빈도보다 수익성이 우선입니다.")
+    print(f"데이터 수집 중... ({days}일)")
+    d15 = add_indicators(fetch_history('15m', now_ms - (days + 3) * day_ms))
+    h1 = add_indicators(fetch_history('1h', now_ms - (days + 15) * day_ms))
+    h4 = add_indicators(fetch_history('4h', now_ms - (days + 60) * day_ms))
+    simulate(d15.reset_index(drop=True), h1.reset_index(drop=True), h4.reset_index(drop=True))
  
  
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--backtest", type=int, metavar="DAYS", help="최근 N일 백테스트")
-    ap.add_argument("--sweep", action="store_true", help="백테스트 시 점수 하한별 비교")
     ap.add_argument("--dry", action="store_true", help="신호만 기록(주문 없음)")
     args = ap.parse_args()
     if args.backtest:
-        run_backtest(args.backtest, args.sweep)
+        run_backtest(args.backtest)
     else:
         main_live(dry=args.dry)
