@@ -6,7 +6,7 @@
   C. 반전 mirror  : 방향 반대 + SL/TP 맞바꿈 (관리 OFF, 시간청산만)
 
 사용법 (봇 파일과 같은 폴더에서)
-  python comparebacktest.py --days 180
+  python comparebacktest.py --days 180 --module bitcoinv5
   python comparebacktest.py --days 365 --module bitcoinv5
   python comparebacktest.py --days 180 --lev 1 --frac 0.3      # 사이즈를 줄여서 비교
 
