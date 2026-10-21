@@ -49,7 +49,7 @@ MANAGE = not (INVERT and INVERT_MODE == "mirror")   # 부분익절/트레일링 
 INV_MAX_HOLD_MIN = 480        # mirror 모드 시간청산 (분)
 
 # --- 투자금 / 레버리지 ---
-MARGIN_FRACTION = 0.10        # 증거금 최대 = 원금의 10%
+MARGIN_FRACTION = 0.50        # 증거금 최대 = 원금의 10%
 MIN_LEV, MAX_LEVERAGE = 1, 5
 DEFAULT_LEV = 2               # AI 미사용/실패 시
 DEFAULT_FRAC = 0.5
