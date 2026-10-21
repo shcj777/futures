@@ -1,27 +1,34 @@
 """
-비트코인 선물 트레이딩 봇 v5  (역방향 매매 + 원금 90% + AI 레버리지 1~5배)
+비트코인 선물 트레이딩 봇 FINAL  (역방향 매매 + 손절 가깝게/익절 멀게 + AI 레버리지 1~5배)
 =====================================================================
-v4 -> v5 변경
-  1) 신호 반전: v4 엔진이 long 이면 SHORT, short 이면 LONG 으로 체결
-       INVERT_MODE = "mirror" : 원신호의 SL <-> TP 거리를 맞바꿈 (진짜 '거울' 반대 매매)
-                                -> 작은 TP(원 SL 거리), 큰 SL(원 TP 거리). 승률 높고 손실 1회가 큼
-       INVERT_MODE = "same"   : 방향만 반대, SL/TP 거리는 원신호 그대로 (RR 3:1 유지)
-  2) 투자금: 증거금(margin)을 원금의 최대 90% 까지 사용
-  3) 레버리지: AI 가 1~5배, 증거금 비중(20~100% of 90%)을 판단. AI 실패 시 기본값(2배, 50%)
-  4) mirror 모드에서는 TP 가 매우 가까우므로 부분익절/본전/트레일링/조기청산은 끄고
-     SL/TP + 시간청산(INV_MAX_HOLD_MIN)만 사용
-  5) 일일 손실/이익 한도 완화(10%): 사이즈가 커서 2% 한도는 1건 손실로 바로 걸림
+신호 엔진은 v4 (추세 눌림목 + 돌파) 를 그대로 사용하고, 체결 방향을 반대로 뒤집습니다.
+  원신호 LONG -> SHORT 체결 / 원신호 SHORT -> LONG 체결
+
+INVERT_MODE (손익 거리 설정 방식)
+  "far_tp" : 방향 반대 + 손절은 가깝게(ATR x FAR_SL_ATR), 익절은 멀게(손절 x FAR_TP_R)   <- 기본
+  "same"   : 방향만 반대, SL/TP 거리는 원신호 그대로 (RR 3:1)
+  "mirror" : 방향 반대 + 원신호의 SL <-> TP 거리를 맞바꿈 (익절 가깝게/손절 멀게)
+
+투자금 / 레버리지
+  - 증거금 = 원금 x MARGIN_FRACTION x (AI 가 정한 비중 0.2~1.0)
+  - AI 가 레버리지 1~5배를 판단. AI 실패/미사용 시 기본값(DEFAULT_LEV, DEFAULT_FRAC)
+  - SL 이 청산가에 가까우면 레버리지를 자동으로 낮춤
+
+포지션 관리
+  - far_tp 기본: SL/TP 브래킷 + 시간청산만 사용 (MANAGE_FAR=True 로 부분익절/트레일링 켤 수 있음)
+  - same: 1R 본전스탑, 1.5R 부분익절, 2R 이상 트레일링, 조기청산 사용
 
 !! 경고 !!
-  - 신호를 반대로 뒤집는다고 수익이 되는 것은 아닙니다. 원 전략의 기대값이 음(-)이어야만 반대가 양(+)이 되며,
-    수수료·슬리피지 때문에 양쪽 모두 손실일 수도 있습니다. 반드시 --backtest 로 먼저 검증하세요.
-  - 원금 90% x 5배 = 명목 4.5배. SL 거리가 가격의 2% 면 SL 1회에 원금 약 9% 손실입니다.
-  - 청산가 보호를 위해 SL 거리가 크면 레버리지를 자동으로 낮춥니다.
+  - 지금까지의 백테스트(180일)에서 원본/same/mirror 모두 평균 R 이 음수였습니다.
+    신호를 뒤집는다고 수익이 되는 것이 아니며, 수수료·슬리피지 때문에 양쪽 모두 손실일 수 있습니다.
+  - 반드시 --compare 로 여러 모드를 비교하고, 기간(90/180/365일)을 바꿔 일관성을 확인하세요.
+  - 실거래 전 --dry 로 충분히 관찰하고, 처음에는 MAX_NOTIONAL_USD 로 상한을 걸고 소액으로 시작하세요.
 
 실행
-  python bitcoinv5.py --backtest 180
-  python bitcoinv5.py --dry
-  python bitcoinv5.py
+  python bitcoinv5.py --backtest 180     # 현재 설정으로 백테스트
+  python bitcoinv5.py --compare 180      # 5가지 설정 한 번에 비교 (표 출력 + CSV 저장)
+  python bitcoinv5.py --dry              # 신호만 기록, 주문 X
+  python bitcoinv5.py                    # 실거래
 """
 import os
 import math
@@ -40,16 +47,22 @@ load_dotenv()
 
 # ===================== 설정 =====================
 SYMBOL = "BTC/USDT:USDT"
-DB_FILE = "bitcoin_trading_inverse.db"
+DB_FILE = "bitcoin_trading_final.db"
 
 # --- 역방향 ---
 INVERT = True
-INVERT_MODE = "mirror"        # "mirror" | "same"
-MANAGE = not (INVERT and INVERT_MODE == "mirror")   # 부분익절/트레일링 등 사용 여부
-INV_MAX_HOLD_MIN = 480        # mirror 모드 시간청산 (분)
+INVERT_MODE = "far_tp"        # "far_tp" | "same" | "mirror"
+MANAGE_FAR = False            # far_tp 에서 부분익절/본전/트레일링/조기청산 사용 여부
+MANAGE = not (INVERT and (INVERT_MODE == "mirror" or (INVERT_MODE == "far_tp" and not MANAGE_FAR)))
+INV_MAX_HOLD_MIN = 480        # 관리 OFF 모드의 시간청산 (분)
+
+# --- far_tp 모드: 손절 가깝게, 익절 멀게 ---
+FAR_SL_ATR = 1.0              # 손절 거리 = ATR x 1.0
+FAR_SL_MIN_PCT = 0.003        # 손절 거리 최소 0.3% (너무 좁으면 비용이 손절폭을 잠식)
+FAR_TP_R = 3.0                # 익절 거리 = 손절 거리 x 3.0
 
 # --- 투자금 / 레버리지 ---
-MARGIN_FRACTION = 0.50        # 증거금 최대 = 원금의 10%
+MARGIN_FRACTION = 0.50        # 증거금 최대 = 원금의 50% (원하면 0.90 까지)
 MIN_LEV, MAX_LEVERAGE = 1, 5
 DEFAULT_LEV = 2               # AI 미사용/실패 시
 DEFAULT_FRAC = 0.5
@@ -91,7 +104,7 @@ EARLY_CUT_MIN = 90
 EARLY_CUT_R = 0.3
 MAX_HOLD_MIN = 300
 
-# 안전 상한(USDT). 0 이면 해제 (기본: 해제 -> 원금 90% 규칙만 적용)
+# 안전 상한(USDT). 0 이면 해제
 MAX_NOTIONAL_USD = float(os.getenv("MAX_NOTIONAL_USD", "0"))
 
 USE_LLM = os.getenv("USE_LLM", "1") == "1"
@@ -305,7 +318,8 @@ def _mk(strategy, side, score, price, sl_dist, atr, rr=None, tp_dist=None, min_r
         if side == 'short' and funding < -0.0005:
             score -= 8
     return {"strategy": strategy, "side": side, "score": int(min(score, 95)), "entry": price,
-            "sl_dist": sl_dist, "tp_dist": tp_dist, "rr": round(real_rr, 2), "reasons": reasons or []}
+            "sl_dist": sl_dist, "tp_dist": tp_dist, "rr": round(real_rr, 2), "reasons": reasons or [],
+            "atr": atr}
 
 
 def evaluate(d, h1, h4, funding=None):
@@ -384,7 +398,7 @@ def evaluate(d, h1, h4, funding=None):
 
 
 def invert_signal(sig):
-    """원신호를 반대 방향으로 변환. mirror 모드는 SL/TP 거리도 맞바꿈."""
+    """원신호를 반대 방향으로 변환하고 모드에 따라 SL/TP 거리를 재설정."""
     if not INVERT:
         return sig
     s = dict(sig)
@@ -394,13 +408,18 @@ def invert_signal(sig):
     if INVERT_MODE == "mirror":
         s['sl_dist'], s['tp_dist'] = sig['tp_dist'], sig['sl_dist']
         s['rr'] = round(s['tp_dist'] / s['sl_dist'], 2)
-    s['reasons'] = [f"[역방향] 원신호 {sig['side'].upper()} -> {s['side'].upper()}"] + list(sig['reasons'])
+    elif INVERT_MODE == "far_tp":
+        s['sl_dist'] = max(FAR_SL_ATR * sig['atr'], sig['entry'] * FAR_SL_MIN_PCT)
+        s['tp_dist'] = FAR_TP_R * s['sl_dist']
+        s['rr'] = round(FAR_TP_R, 2)
+    s['reasons'] = [f"[역방향/{INVERT_MODE}] 원신호 {sig['side'].upper()} -> {s['side'].upper()}"] \
+                   + list(sig['reasons'])
     return s
 
 
-# ===================== 포지션 사이징 (증거금 90% 기준) =====================
+# ===================== 포지션 사이징 =====================
 def calc_position(equity, entry, sl_dist, leverage=DEFAULT_LEV, frac=DEFAULT_FRAC):
-    """증거금 = 원금 x 90% x frac, 명목 = 증거금 x 레버리지.
+    """증거금 = 원금 x MARGIN_FRACTION x frac, 명목 = 증거금 x 레버리지.
     SL 거리가 청산가에 너무 가까우면 레버리지를 자동으로 낮춘다."""
     leverage = int(min(MAX_LEVERAGE, max(MIN_LEV, leverage)))
     frac = min(1.0, max(MIN_FRAC, frac))
@@ -556,12 +575,13 @@ def llm_review(sig, d, h1, h4):
             "last_6_candles_15m": d.tail(6)[['open', 'high', 'low', 'close']].round(1).values.tolist(),
             "news": fetch_news(),
             "strategy_recent_perf": strategy_stats(),
-            "limits": {"leverage": "1-5", "size_fraction": "0.2-1.0 of the 90% margin budget"},
+            "limits": {"leverage": "1-5", "size_fraction": "0.2-1.0 of the margin budget"},
         }
         sys_prompt = (
             "You are a risk manager for an automated BTC futures bot that deliberately FADES (trades opposite to) "
             "a trend/breakout signal. 'side_to_execute' is the real order direction; 'original_signal_side' is the "
-            "signal being faded. Decide: (1) verdict APPROVE or VETO. VETO only with concrete evidence, e.g. a strong "
+            "signal being faded. The trade uses a tight stop and a far take-profit, so a low win rate is expected. "
+            "Decide: (1) verdict APPROVE or VETO. VETO only with concrete evidence, e.g. a strong "
             "trend/news move that is clearly running against side_to_execute with high ADX and momentum, or this "
             "strategy's recent performance is clearly poor. (2) leverage, integer 1-5: use higher leverage ONLY when "
             "the stop distance is small relative to price, volatility (atr_pct) is low, and the setup is clean; "
@@ -685,7 +705,7 @@ def manage_position(trade, side, amt):
     r_now = dirn * (price - entry) / r_dist
     age_min = (datetime.now() - datetime.fromisoformat(trade['timestamp'])).total_seconds() / 60
 
-    # mirror 모드: SL/TP 브래킷 + 시간청산만 사용
+    # 관리 OFF 모드: SL/TP 브래킷 + 시간청산만 사용
     if not MANAGE:
         if age_min >= INV_MAX_HOLD_MIN:
             print(f"시간 청산 ({age_min:.0f}분 경과, {r_now:+.2f}R)")
@@ -759,7 +779,7 @@ def run_signal_cycle(dry=False):
         return
 
     orig = sigs[0]
-    sig = invert_signal(orig)      # <<< 방향 반전
+    sig = invert_signal(orig)      # <<< 방향 반전 + SL/TP 재설정
     print(f"[{datetime.now():%H:%M}] 원신호 {orig['strategy']} {orig['side'].upper()} (점수 {orig['score']}) "
           f"-> 실행 {sig['side'].upper()} | SL {sig['sl_dist'] / price * 100:.2f}% / "
           f"TP {sig['tp_dist'] / price * 100:.2f}% (RR {sig['rr']})")
@@ -812,7 +832,7 @@ def run_signal_cycle(dry=False):
 
 # ===================== 메인 루프 =====================
 def main_live(dry=False):
-    print("\n=== Bitcoin Inverse Bot v5 시작 ===", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    print("\n=== Bitcoin Bot FINAL 시작 ===", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     print(f"모드: {'DRY-RUN(주문 없음)' if dry else '실거래'} | 반전: {INVERT} ({INVERT_MODE}) | "
           f"AI: {LLM_MODEL if USE_LLM else 'OFF'} | 증거금 최대 {MARGIN_FRACTION:.0%} | "
           f"레버리지 {MIN_LEV}~{MAX_LEVERAGE}x | 최소점수 {MIN_SCORE} | 관리기능 {MANAGE}")
@@ -880,8 +900,8 @@ def _better(a, b, dn):
 
 
 def simulate(df15, h1, h4, equity0=1000.0, warmup=120, verbose=True):
-    """원신호 -> (반전) -> 다음 봉 시가 진입. SL/TP 동시 터치 시 SL 우선(보수적).
-    증거금 90% x 고정 레버리지(BT_LEVERAGE) 로 사이징. (AI 판단은 백테스트에서 제외)"""
+    """원신호 -> (반전/SL·TP 재설정) -> 다음 봉 시가 진입. SL/TP 동시 터치 시 SL 우선(보수적).
+    증거금 MARGIN_FRACTION x 고정 레버리지(BT_LEVERAGE) 로 사이징. (AI 판단은 백테스트에서 제외)"""
     ct15 = (df15['timestamp'] + pd.Timedelta(minutes=15)).values
     ct1 = (h1['timestamp'] + pd.Timedelta(hours=1)).values
     ct4 = (h4['timestamp'] + pd.Timedelta(hours=4)).values
@@ -992,7 +1012,8 @@ def simulate(df15, h1, h4, equity0=1000.0, warmup=120, verbose=True):
                     "avg_loss_R": float(np.mean([t['R'] for t in losses])) if losses else 0.0,
                     "profit_factor": gp / gl if gl > 0 else float('inf')})
     if verbose:
-        print(f"\n===== 백테스트 결과 (반전={INVERT}/{INVERT_MODE}, {BT_LEVERAGE}x, 증거금 {MARGIN_FRACTION:.0%}) =====")
+        print(f"\n===== 백테스트 결과 (반전={INVERT}/{INVERT_MODE}, 관리={MANAGE}, "
+              f"{BT_LEVERAGE}x, 증거금 {MARGIN_FRACTION:.0%}) =====")
         for k, v in res.items():
             print(f"{k:>16}: {v:.2f}" if isinstance(v, float) else f"{k:>16}: {v}")
         if n:
@@ -1009,22 +1030,80 @@ def simulate(df15, h1, h4, equity0=1000.0, warmup=120, verbose=True):
     return res
 
 
-def run_backtest(days):
+def load_backtest_data(days):
     now_ms = exchange.milliseconds()
     day_ms = 86400000
     print(f"데이터 수집 중... ({days}일)")
-    d15 = add_indicators(fetch_history('15m', now_ms - (days + 3) * day_ms))
-    h1 = add_indicators(fetch_history('1h', now_ms - (days + 15) * day_ms))
-    h4 = add_indicators(fetch_history('4h', now_ms - (days + 60) * day_ms))
-    simulate(d15.reset_index(drop=True), h1.reset_index(drop=True), h4.reset_index(drop=True))
+    d15 = add_indicators(fetch_history('15m', now_ms - (days + 3) * day_ms)).reset_index(drop=True)
+    h1 = add_indicators(fetch_history('1h', now_ms - (days + 15) * day_ms)).reset_index(drop=True)
+    h4 = add_indicators(fetch_history('4h', now_ms - (days + 60) * day_ms)).reset_index(drop=True)
+    return d15, h1, h4
+
+
+def run_backtest(days):
+    d15, h1, h4 = load_backtest_data(days)
+    simulate(d15, h1, h4)
+
+
+def run_compare(days):
+    """5가지 설정을 같은 데이터로 한 번에 백테스트해서 표로 비교."""
+    global INVERT, INVERT_MODE, MANAGE
+    saved = (INVERT, INVERT_MODE, MANAGE)
+    d15, h1, h4 = load_backtest_data(days)
+
+    configs = [
+        ("A. 원본 v4 (반전X)", False, "same", True),
+        ("B. 반전 same", True, "same", True),
+        ("C. 반전 mirror", True, "mirror", False),
+        ("D. 반전 far_tp", True, "far_tp", False),
+        ("E. 반전 far_tp+관리", True, "far_tp", True),
+    ]
+    rows, detail = [], {}
+    try:
+        for name, inv, mode, manage in configs:
+            INVERT, INVERT_MODE, MANAGE = inv, mode, manage
+            print(f">>> 실행 중: {name}")
+            res = simulate(d15, h1, h4, verbose=False)
+            detail[name] = res.pop("_trades")
+            rows.append({"설정": name, **res})
+    finally:
+        INVERT, INVERT_MODE, MANAGE = saved
+
+    table = pd.DataFrame(rows).set_index("설정")
+    cols = ["trades", "win_rate", "avg_R", "avg_win_R", "avg_loss_R", "profit_factor",
+            "return_pct", "max_dd_pct", "final_equity"]
+    table = table[[c for c in cols if c in table.columns]]
+    pd.set_option("display.width", 220)
+    pd.set_option("display.max_columns", 20)
+    print(f"\n===== 비교 결과 ({days}일, {BT_LEVERAGE}x, 증거금 {MARGIN_FRACTION:.0%}, "
+          f"far_tp: SL {FAR_SL_ATR}ATR / TP {FAR_TP_R}R) =====")
+    print(table.round(2).to_string())
+
+    print("\n-- 전략별 평균 R --")
+    for name, trades in detail.items():
+        by = {}
+        for t in trades:
+            by.setdefault(t['strategy'], []).append(t['R'])
+        line = " | ".join(f"{k}: {sum(v) / len(v):+.2f}R ({len(v)}건)" for k, v in by.items()) or "거래 없음"
+        print(f"{name:<22} {line}")
+
+    print("\n-- 판단 기준 --")
+    print("  avg_R > 0, profit_factor > 1.3, 거래 100건 이상 -> 검토할 가치가 있음")
+    print("  모든 설정이 avg_R < 0 이면 신호 엔진 자체에 우위가 없는 것입니다.")
+    print("  90/180/365일 모두에서 일관되게 좋은지 확인하세요. 한 기간만 좋으면 우연일 수 있습니다.")
+    table.round(4).to_csv("compare_backtest_result.csv", encoding="utf-8-sig")
+    print("\n결과 저장: compare_backtest_result.csv")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backtest", type=int, metavar="DAYS", help="최근 N일 백테스트 (180 이상 권장)")
+    ap.add_argument("--backtest", type=int, metavar="DAYS", help="현재 설정으로 최근 N일 백테스트 (180 이상 권장)")
+    ap.add_argument("--compare", type=int, metavar="DAYS", help="5가지 설정을 한 번에 비교 백테스트")
     ap.add_argument("--dry", action="store_true", help="신호만 기록(주문 없음)")
     args = ap.parse_args()
-    if args.backtest:
+    if args.compare:
+        run_compare(args.compare)
+    elif args.backtest:
         run_backtest(args.backtest)
     else:
         main_live(dry=args.dry)
