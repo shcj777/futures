@@ -19,9 +19,9 @@ v4 -> v5 변경
   - 청산가 보호를 위해 SL 거리가 크면 레버리지를 자동으로 낮춥니다.
 
 실행
-  python bitcoin_inverse_v5.py --backtest 180
-  python bitcoin_inverse_v5.py --dry
-  python bitcoin_inverse_v5.py
+  python bitcoinv5.py --backtest 180
+  python bitcoinv5.py --dry
+  python bitcoinv5.py
 """
 import os
 import math
@@ -49,13 +49,13 @@ MANAGE = not (INVERT and INVERT_MODE == "mirror")   # 부분익절/트레일링 
 INV_MAX_HOLD_MIN = 480        # mirror 모드 시간청산 (분)
 
 # --- 투자금 / 레버리지 ---
-MARGIN_FRACTION = 0.90        # 증거금 최대 = 원금의 90%
+MARGIN_FRACTION = 0.10        # 증거금 최대 = 원금의 10%
 MIN_LEV, MAX_LEVERAGE = 1, 5
 DEFAULT_LEV = 2               # AI 미사용/실패 시
 DEFAULT_FRAC = 0.5
 MIN_FRAC = 0.2
 LIQ_SAFETY = 0.6              # SL 거리가 (청산거리 x 0.6) 이내가 되도록 레버리지 제한
-BT_LEVERAGE = 3               # 백테스트 고정 레버리지
+BT_LEVERAGE = 1               # 백테스트 고정 레버리지
 BT_FRAC = 1.0
 
 # --- 위험 관리 ---
