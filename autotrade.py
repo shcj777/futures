@@ -1055,3 +1055,233 @@ IMPORTANT: Do not format your response as a code block. Do not include ```json, 
     except Exception as e:
         print(f"\n Error: {e}")
         time.sleep(5)
+
+# ===================== 백테스트 =====================
+def fetch_history(tf, since_ms):
+    out, step = [], exchange.parse_timeframe(tf) * 1000
+    while True:
+        batch = exchange.fetch_ohlcv(SYMBOL, tf, since=since_ms, limit=1000)
+        if not batch:
+            break
+        out += batch
+        since_ms = batch[-1][0] + step
+        if len(batch) < 1000:
+            break
+    df = pd.DataFrame(out, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df = df.drop_duplicates('timestamp').reset_index(drop=True)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df.iloc[:-1]
+
+
+def _better(a, b, dn):
+    return max(a, b) if dn == 1 else min(a, b)
+
+
+def simulate(df15, h1, h4, equity0=1000.0, warmup=120, verbose=True):
+    """원신호 -> (반전/SL·TP 재설정) -> 다음 봉 시가 진입. SL/TP 동시 터치 시 SL 우선(보수적).
+    증거금 MARGIN_FRACTION x 고정 레버리지(BT_LEVERAGE) 로 사이징. (AI 판단은 백테스트에서 제외)"""
+    ct15 = (df15['timestamp'] + pd.Timedelta(minutes=15)).values
+    ct1 = (h1['timestamp'] + pd.Timedelta(hours=1)).values
+    ct4 = (h4['timestamp'] + pd.Timedelta(hours=4)).values
+    eq, peak, mdd = equity0, equity0, 0.0
+    trades, pos, pending = [], None, None
+    cur_day, day_start, day_n, halted, consec, cool_until = None, eq, 0, False, 0, -1
+    hold_bars = MAX_HOLD_MIN // 15
+    inv_hold_bars = INV_MAX_HOLD_MIN // 15
+    cut_bars = max(1, EARLY_CUT_MIN // 15)
+
+    for i in range(warmup, len(df15)):
+        bar = df15.iloc[i]
+        day = bar['timestamp'].date()
+        if day != cur_day:
+            cur_day, day_start, day_n, halted = day, eq, 0, False
+
+        # --- 진입 ---
+        if pending and pos is None:
+            s = pending
+            e = bar['open'] * (1 + (SLIPPAGE if s['side'] == 'long' else -SLIPPAGE))
+            dirn = 1 if s['side'] == 'long' else -1
+            q = calc_position(eq, e, s['sl_dist'], BT_LEVERAGE, BT_FRAC)
+            if q:
+                pos = {"side": s['side'], "dirn": dirn, "entry": e, "qty": q['qty'], "r": s['sl_dist'],
+                       "sl": e - dirn * s['sl_dist'], "tp": e + dirn * s['tp_dist'], "open_i": i,
+                       "ext": e, "risk": q['risk_amt'], "strategy": s['strategy'], "score": s['score'],
+                       "partial": False, "banked": 0.0}
+                day_n += 1
+            pending = None
+
+        # --- 포지션 관리 ---
+        if pos:
+            dn = pos['dirn']
+            hit_sl = bar['low'] <= pos['sl'] if dn == 1 else bar['high'] >= pos['sl']
+            hit_tp = bar['high'] >= pos['tp'] if dn == 1 else bar['low'] <= pos['tp']
+            exit_p = None
+            if hit_sl:
+                exit_p = pos['sl'] * (1 - dn * SLIPPAGE)
+            elif hit_tp:
+                exit_p = pos['tp']
+            else:
+                age = i - pos['open_i']
+                if not MANAGE:
+                    if age >= inv_hold_bars:
+                        exit_p = bar['close'] * (1 - dn * SLIPPAGE)
+                else:
+                    pos['ext'] = max(pos['ext'], bar['high']) if dn == 1 else min(pos['ext'], bar['low'])
+                    r_ext = dn * (pos['ext'] - pos['entry']) / pos['r']
+                    if r_ext >= BE_R:
+                        pos['sl'] = _better(pos['sl'], pos['entry'] + dn * pos['entry'] * BE_BUFFER, dn)
+                    if r_ext >= TRAIL_START_R:
+                        pos['sl'] = _better(pos['sl'], pos['ext'] - dn * TRAIL_DIST_R * pos['r'], dn)
+                    if not pos['partial'] and r_ext >= PARTIAL_R:
+                        q_half = pos['qty'] * PARTIAL_FRAC
+                        p_px = pos['entry'] + dn * PARTIAL_R * pos['r']
+                        fee = (pos['entry'] + p_px) * q_half * FEE_RATE
+                        part = dn * (p_px - pos['entry']) * q_half - fee
+                        eq += part
+                        pos['banked'] += part
+                        pos['qty'] -= q_half
+                        pos['partial'] = True
+                        pos['sl'] = _better(pos['sl'], pos['entry'] + dn * pos['entry'] * BE_BUFFER, dn)
+                    r_now = dn * (bar['close'] - pos['entry']) / pos['r']
+                    if (not pos['partial'] and age >= cut_bars and r_now < EARLY_CUT_R) or \
+                            (age >= hold_bars and r_now < 0.5):
+                        exit_p = bar['close'] * (1 - dn * SLIPPAGE)
+
+            if exit_p is not None:
+                fees = (pos['entry'] + exit_p) * pos['qty'] * FEE_RATE
+                pnl_last = dn * (exit_p - pos['entry']) * pos['qty'] - fees
+                eq += pnl_last
+                pnl = pnl_last + pos['banked']
+                trades.append({"strategy": pos['strategy'], "pnl": pnl, "R": pnl / pos['risk'],
+                               "bars": i - pos['open_i'], "day": day, "score": pos['score']})
+                consec = consec + 1 if pnl < 0 else 0
+                if consec >= MAX_CONSEC_LOSSES:
+                    cool_until, consec = i + COOLDOWN_MIN // 15, 0
+                pos = None
+                peak = max(peak, eq)
+                mdd = max(mdd, (peak - eq) / peak)
+                if eq - day_start <= -DAILY_LOSS_LIMIT * day_start:
+                    halted = True
+                if eq - day_start >= DAILY_PROFIT_LOCK * day_start:
+                    halted = True
+                if eq <= 0:
+                    break
+
+        # --- 신호 평가 ---
+        if pos is None and not halted and day_n < MAX_TRADES_PER_DAY and i >= cool_until and i < len(df15) - 1:
+            j1 = np.searchsorted(ct1, ct15[i], side='right') - 1
+            j4 = np.searchsorted(ct4, ct15[i], side='right') - 1
+            if j1 >= 0 and j4 >= 0:
+                sigs = [s for s in evaluate(df15.iloc[i - 29:i + 1], h1.iloc[j1], h4.iloc[j4])
+                        if s['score'] >= MIN_SCORE]
+                if sigs:
+                    pending = invert_signal(sigs[0])
+
+    n = len(trades)
+    res = {"trades": n, "final_equity": eq, "return_pct": (eq / equity0 - 1) * 100, "max_dd_pct": mdd * 100}
+    if n:
+        wins = [t for t in trades if t['pnl'] > 0]
+        losses = [t for t in trades if t['pnl'] <= 0]
+        gp, gl = sum(t['pnl'] for t in wins), -sum(t['pnl'] for t in losses)
+        span = max(1, (df15['timestamp'].iloc[-1] - df15['timestamp'].iloc[warmup]).days)
+        res.update({"trades_per_day": n / span, "win_rate": len(wins) / n * 100,
+                    "avg_R": float(np.mean([t['R'] for t in trades])),
+                    "avg_win_R": float(np.mean([t['R'] for t in wins])) if wins else 0.0,
+                    "avg_loss_R": float(np.mean([t['R'] for t in losses])) if losses else 0.0,
+                    "profit_factor": gp / gl if gl > 0 else float('inf')})
+    if verbose:
+        print(f"\n===== 백테스트 결과 (반전={INVERT}/{INVERT_MODE}, 관리={MANAGE}, "
+              f"{BT_LEVERAGE}x, 증거금 {MARGIN_FRACTION:.0%}) =====")
+        for k, v in res.items():
+            print(f"{k:>16}: {v:.2f}" if isinstance(v, float) else f"{k:>16}: {v}")
+        if n:
+            print("\n-- 전략별 (거래수, 평균R, 승률%) --")
+            by = {}
+            for t in trades:
+                by.setdefault(t['strategy'], []).append(t)
+            for k, v in by.items():
+                print(f"{k:>16}: {len(v)}건 | {np.mean([x['R'] for x in v]):+.2f}R | "
+                      f"{sum(1 for x in v if x['pnl'] > 0) / len(v) * 100:.0f}%")
+        print("\n※ 백테스트에는 AI 판단이 포함되지 않으며, 과거 성과는 미래를 보장하지 않습니다.")
+        print("※ 평균 R > 0, 프로핏 팩터 > 1.3, MDD 가 감당 가능한 수준, 거래 100건 이상인지 확인하세요.")
+    res["_trades"] = trades
+    return res
+
+
+def load_backtest_data(days):
+    now_ms = exchange.milliseconds()
+    day_ms = 86400000
+    print(f"데이터 수집 중... ({days}일)")
+    d15 = add_indicators(fetch_history('15m', now_ms - (days + 3) * day_ms)).reset_index(drop=True)
+    h1 = add_indicators(fetch_history('1h', now_ms - (days + 15) * day_ms)).reset_index(drop=True)
+    h4 = add_indicators(fetch_history('4h', now_ms - (days + 60) * day_ms)).reset_index(drop=True)
+    return d15, h1, h4
+
+
+def run_backtest(days):
+    d15, h1, h4 = load_backtest_data(days)
+    simulate(d15, h1, h4)
+
+
+def run_compare(days):
+    """5가지 설정을 같은 데이터로 한 번에 백테스트해서 표로 비교."""
+    global INVERT, INVERT_MODE, MANAGE
+    saved = (INVERT, INVERT_MODE, MANAGE)
+    d15, h1, h4 = load_backtest_data(days)
+
+    configs = [
+        ("A. 원본 v4 (반전X)", False, "same", True),
+        ("B. 반전 same", True, "same", True),
+        ("C. 반전 mirror", True, "mirror", False),
+        ("D. 반전 far_tp", True, "far_tp", False),
+        ("E. 반전 far_tp+관리", True, "far_tp", True),
+    ]
+    rows, detail = [], {}
+    try:
+        for name, inv, mode, manage in configs:
+            INVERT, INVERT_MODE, MANAGE = inv, mode, manage
+            print(f">>> 실행 중: {name}")
+            res = simulate(d15, h1, h4, verbose=False)
+            detail[name] = res.pop("_trades")
+            rows.append({"설정": name, **res})
+    finally:
+        INVERT, INVERT_MODE, MANAGE = saved
+
+    table = pd.DataFrame(rows).set_index("설정")
+    cols = ["trades", "win_rate", "avg_R", "avg_win_R", "avg_loss_R", "profit_factor",
+            "return_pct", "max_dd_pct", "final_equity"]
+    table = table[[c for c in cols if c in table.columns]]
+    pd.set_option("display.width", 220)
+    pd.set_option("display.max_columns", 20)
+    print(f"\n===== 비교 결과 ({days}일, {BT_LEVERAGE}x, 증거금 {MARGIN_FRACTION:.0%}, "
+          f"far_tp: SL {FAR_SL_ATR}ATR / TP {FAR_TP_R}R) =====")
+    print(table.round(2).to_string())
+
+    print("\n-- 전략별 평균 R --")
+    for name, trades in detail.items():
+        by = {}
+        for t in trades:
+            by.setdefault(t['strategy'], []).append(t['R'])
+        line = " | ".join(f"{k}: {sum(v) / len(v):+.2f}R ({len(v)}건)" for k, v in by.items()) or "거래 없음"
+        print(f"{name:<22} {line}")
+
+    print("\n-- 판단 기준 --")
+    print("  avg_R > 0, profit_factor > 1.3, 거래 100건 이상 -> 검토할 가치가 있음")
+    print("  모든 설정이 avg_R < 0 이면 신호 엔진 자체에 우위가 없는 것입니다.")
+    print("  90/180/365일 모두에서 일관되게 좋은지 확인하세요. 한 기간만 좋으면 우연일 수 있습니다.")
+    table.round(4).to_csv("compare_backtest_result.csv", encoding="utf-8-sig")
+    print("\n결과 저장: compare_backtest_result.csv")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--backtest", type=int, metavar="DAYS", help="현재 설정으로 최근 N일 백테스트 (180 이상 권장)")
+    ap.add_argument("--compare", type=int, metavar="DAYS", help="5가지 설정을 한 번에 비교 백테스트")
+    ap.add_argument("--dry", action="store_true", help="신호만 기록(주문 없음)")
+    args = ap.parse_args()
+    if args.compare:
+        run_compare(args.compare)
+    elif args.backtest:
+        run_backtest(args.backtest)
+    else:
+        main_live(dry=args.dry)
