@@ -28,9 +28,9 @@ from datetime import datetime, timedelta, timezone
 # ===================== 설정 =====================
 SYMBOL = "BTC/USDT:USDT"
 NOTIONAL = 1000.0            # 진입 금액 (USDT), 레버리지 1배
-TP = 0.005                   # 익절 +0.5%
+TP = 0.0025                   # 익절 +0.25%
 SL = 0.0020                  # 손절 -0.2%
-START_H, END_H = 22, 24      # 운영 시간 (한국시간)
+START_H, END_H = 22, 23      # 운영 시간 (한국시간)
 LOOKBACK = 60                # 22시 기준 직전 몇 분의 등락으로 방향을 정할지
 FEE = 0.0005                 # 편도 수수료
 SLIP = 0.0002                # 편도 슬리피지
