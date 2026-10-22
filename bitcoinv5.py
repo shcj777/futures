@@ -12,11 +12,11 @@
 
 실행
   pip install ccxt pandas numpy
-  python bitcoin_night.py --backtest 365                # 최근 365일 백테스트
-  python bitcoin_night.py --backtest 365 --lookback 30  # 신호 판단 구간을 30분으로
-  python bitcoin_night.py --backtest 200 --synthetic    # 가짜 데이터로 동작 점검
-  python bitcoin_night.py                               # 모의매매 (주문 없음)
-  python bitcoin_night.py --stats                       # 모의매매 누적 성적
+  python bitcoinv5.py --backtest 365                # 최근 365일 백테스트
+  python bitcoinv5.py --backtest 365 --lookback 30  # 신호 판단 구간을 30분으로
+  python bitcoinv5.py --backtest 200 --synthetic    # 가짜 데이터로 동작 점검
+  python bitcoinv5.py                               # 모의매매 (주문 없음)
+  python bitcoinv5.py --stats                       # 모의매매 누적 성적
 """
 import time
 import argparse
