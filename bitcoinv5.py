@@ -1,9 +1,9 @@
 """
-한국시간 22:00~24:00 비트코인 단타 전략 (백테스트 + 모의매매)
+한국시간 22:00~24:00 비트코인 역방향 단타 전략 (백테스트 + 모의매매)
 =====================================================================
 규칙
   - 매일 한국시간(KST) 22:00~24:00 에만 운영 (UTC 13:00~15:00)
-  - 22:00 시점에 직전 LOOKBACK분(기본 60분) 동안 가격이 올랐으면 LONG, 내렸으면 SHORT
+  - 22:00 시점에 직전 LOOKBACK분(기본 60분) 동안 가격이 올랐으면 SHORT, 내렸으면 LONG (역방향)
   - 진입 금액 1000 USDT 고정, 레버리지 1배
   - 익절 +1.0% / 손절 -0.25% (진입가 기준, 수수료/슬리피지 별도 반영)
   - 24:00 까지 익절/손절이 안 나면 그 시점 가격으로 강제 청산 (하루 1회 거래)
@@ -13,7 +13,7 @@
 실행
   pip install ccxt pandas numpy
   python bitcoinv5.py --backtest 365                # 최근 365일 백테스트
-  python bitcoinv5.py --backtest 365 --lookback 30  # 신호 판단 구간을 30분으로
+  python bitcoinv5.py.py --backtest 365 --lookback 30  # 신호 판단 구간을 30분으로
   python bitcoinv5.py --backtest 200 --synthetic    # 가짜 데이터로 동작 점검
   python bitcoinv5.py                               # 모의매매 (주문 없음)
   python bitcoinv5.py --stats                       # 모의매매 누적 성적
@@ -36,7 +36,7 @@ FEE = 0.0005                 # 편도 수수료
 SLIP = 0.0002                # 편도 슬리피지
 COST = FEE + SLIP
 WINDOW_MIN = (END_H - START_H) * 60      # 운영 시간(분) = 120
-DB_FILE = "night_paper.db"
+DB_FILE = "night_contrarian_paper.db"
 
 KST = timezone(timedelta(hours=9))
 UTC_START_H = START_H - 9                # 한국 22시 = UTC 13시
@@ -57,13 +57,13 @@ def get_ex():
 def run_day(df, lb):
     """
     df: 1분봉 (lb + 120개). 인덱스 0 = 22시 lb분 전, 인덱스 lb = 22:00 봉.
-    신호: 22:00 봉 시가 vs lb분 전 봉 시가. 체결: 22:00 봉 시가.
+    신호: 22:00 봉 시가 vs lb분 전 봉 시가의 반대 방향. 체결: 22:00 봉 시가.
     """
     o, h, l, c = (df[k].values for k in ('open', 'high', 'low', 'close'))
     ref, ent_open = o[0], o[lb]
     if ent_open == ref:
         return None
-    sig = 1 if ent_open > ref else -1
+    sig = -1 if ent_open > ref else 1               # 올랐으면 SHORT, 내렸으면 LONG
     entry = ent_open * (1 + sig * COST)              # 롱은 높게, 숏은 낮게 체결
     tp_px = entry * (1 + sig * TP)
     sl_px = entry * (1 - sig * SL)
@@ -132,7 +132,7 @@ def fmt(m):
 def backtest(days, lb, use_synth):
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     trades = []
-    print(f"\n===== 한국시간 {START_H}~{END_H}시 단타 백테스트 (최근 {days}일, 신호 구간 {lb}분) =====")
+    print(f"\n===== 한국시간 {START_H}~{END_H}시 역방향 단타 백테스트 (최근 {days}일, 신호 구간 {lb}분) =====")
     print(f"진입 {NOTIONAL:,.0f} USDT x 1배 | 익절 +{TP * 100:.2f}% / 손절 -{SL * 100:.2f}% | "
           f"수수료 {FEE * 100:.2f}% + 슬리피지 {SLIP * 100:.2f}% (편도)\n")
     for k in range(days, 0, -1):                      # 오늘은 아직 끝나지 않았을 수 있어 제외
@@ -206,7 +206,7 @@ def enter(now, lb):
     raw = get_ex().fetch_ohlcv(SYMBOL, '1m', limit=lb + 5)
     closed = raw[:-1]                                  # 형성 중인 봉 제외
     ref, last = float(closed[-lb][1]), float(closed[-1][4])
-    sig = 1 if last > ref else -1
+    sig = -1 if last > ref else 1                      # 올랐으면 SHORT, 내렸으면 LONG
     entry = last_price() * (1 + sig * COST)
     tp_px, sl_px = entry * (1 + sig * TP), entry * (1 - sig * SL)
     conn = db()
@@ -234,7 +234,7 @@ def close_pos(pos, price, reason, now):
 
 def paper_main(lb):
     setup_db()
-    print(f"\n=== 한국시간 {START_H}~{END_H}시 단타 모의매매 === {datetime.now(KST):%Y-%m-%d %H:%M}")
+    print(f"\n=== 한국시간 {START_H}~{END_H}시 역방향 단타 모의매매 === {datetime.now(KST):%Y-%m-%d %H:%M}")
     print(f"{SYMBOL} | {NOTIONAL:,.0f} USDT x 1배 | 익절 +{TP * 100:.2f}% / 손절 -{SL * 100:.2f}% | 주문 없음 (Ctrl+C 종료)")
     while True:
         try:
