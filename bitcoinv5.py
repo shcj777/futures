@@ -1,38 +1,45 @@
 """
-5일/20일 이동평균 교차 전략 (롱 <-> 숏 계속 전환, 자본의 50% 진입)
+한국시간 22:00~24:00 비트코인 단타 전략 (백테스트 + 모의매매)
 =====================================================================
 규칙
-  - 5일선이 20일선을 위로 돌파(골든크로스): 숏 청산 + 롱 진입
-  - 5일선이 20일선을 아래로 돌파(데드크로스): 롱 청산 + 숏 진입
-  - 진입 금액 = 현재 자본의 50% (레버리지 1배), 항상 포지션 보유
-  - 신호는 봉 종가 확정 후 판단, 체결은 다음 봉 시가 (미래 참조 방지)
-  - 익절/손절/반대매매 없음. 오직 교차 신호로만 전환
+  - 매일 한국시간(KST) 22:00~24:00 에만 운영 (UTC 13:00~15:00)
+  - 22:00 시점에 직전 LOOKBACK분(기본 60분) 동안 가격이 올랐으면 LONG, 내렸으면 SHORT
+  - 진입 금액 1000 USDT 고정, 레버리지 1배
+  - 익절 +1.0% / 손절 -0.25% (진입가 기준, 수수료/슬리피지 별도 반영)
+  - 24:00 까지 익절/손절이 안 나면 그 시점 가격으로 강제 청산 (하루 1회 거래)
+  - 같은 1분봉 안에서 익절/손절이 모두 닿으면 손절 먼저 난 것으로 계산 (보수적)
   - 실거래 기능 없음 (백테스트 + 모의매매)
 
 실행
   pip install ccxt pandas numpy
-  python bitcoinv5.py --backtest 1000                  # 일봉 1000일, 거래량 상위 10종목
-  python bitcoinv5.py --backtest 1500 --symbols BTC,ETH
-  python bitcoinv5.py --backtest 500 --synthetic       # 가짜 데이터로 동작 점검
-  python bitcoinv5.py                                  # 모의매매 (하루 1회 점검, 주문 없음)
-  python bitcoinv5.py --stats                          # 모의매매 누적 성적
+  python bitcoin_night.py --backtest 365                # 최근 365일 백테스트
+  python bitcoin_night.py --backtest 365 --lookback 30  # 신호 판단 구간을 30분으로
+  python bitcoin_night.py --backtest 200 --synthetic    # 가짜 데이터로 동작 점검
+  python bitcoin_night.py                               # 모의매매 (주문 없음)
+  python bitcoin_night.py --stats                       # 모의매매 누적 성적
 """
 import time
 import argparse
 import sqlite3
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # ===================== 설정 =====================
-TF = "1d"
-FAST, SLOW = 5, 20
-POS_FRAC = 0.50             # 거래당 투입 금액 = 현재 자본의 50%
-FEE = 0.0005                # 편도 수수료
-SLIP = 0.0002               # 편도 슬리피지
-EQ0 = 1000.0
-N_SYMBOLS = 10
-DB_FILE = "ma_cross_paper.db"
+SYMBOL = "BTC/USDT:USDT"
+NOTIONAL = 1000.0            # 진입 금액 (USDT), 레버리지 1배
+TP = 0.010                   # 익절 +1.0%
+SL = 0.0025                  # 손절 -0.25%
+START_H, END_H = 22, 24      # 운영 시간 (한국시간)
+LOOKBACK = 60                # 22시 기준 직전 몇 분의 등락으로 방향을 정할지
+FEE = 0.0005                 # 편도 수수료
+SLIP = 0.0002                # 편도 슬리피지
+COST = FEE + SLIP
+WINDOW_MIN = (END_H - START_H) * 60      # 운영 시간(분) = 120
+DB_FILE = "night_paper.db"
+
+KST = timezone(timedelta(hours=9))
+UTC_START_H = START_H - 9                # 한국 22시 = UTC 13시
 
 _ex = None
 
@@ -46,55 +53,66 @@ def get_ex():
     return _ex
 
 
-# ===================== 신호 =====================
-def add_ma(df):
-    d = df.copy()
-    d['fast'] = d['close'].rolling(FAST).mean()
-    d['slow'] = d['close'].rolling(SLOW).mean()
-    return d
+# ===================== 하루치 시뮬레이션 =====================
+def run_day(df, lb):
+    """
+    df: 1분봉 (lb + 120개). 인덱스 0 = 22시 lb분 전, 인덱스 lb = 22:00 봉.
+    신호: 22:00 봉 시가 vs lb분 전 봉 시가. 체결: 22:00 봉 시가.
+    """
+    o, h, l, c = (df[k].values for k in ('open', 'high', 'low', 'close'))
+    ref, ent_open = o[0], o[lb]
+    if ent_open == ref:
+        return None
+    sig = 1 if ent_open > ref else -1
+    entry = ent_open * (1 + sig * COST)              # 롱은 높게, 숏은 낮게 체결
+    tp_px = entry * (1 + sig * TP)
+    sl_px = entry * (1 - sig * SL)
+
+    reason, level = 'TIME', c[-1]
+    for j in range(lb, len(o)):
+        if sig == 1:
+            hit_sl, hit_tp = l[j] <= sl_px, h[j] >= tp_px
+        else:
+            hit_sl, hit_tp = h[j] >= sl_px, l[j] <= tp_px
+        if hit_sl:                                    # 같은 봉에서 둘 다 닿으면 손절 우선
+            reason, level = 'SL', sl_px
+            break
+        if hit_tp:
+            reason, level = 'TP', tp_px
+            break
+    px = level * (1 - sig * COST)                     # 청산 비용 반영
+    ret = sig * (px - entry) / entry
+    return dict(date=df['timestamp'].iloc[lb], dir=sig, reason=reason,
+                ret=ret, pnl=ret * NOTIONAL)
 
 
-def cross_array(d):
-    """+1: 골든크로스(5선이 20선 위로), -1: 데드크로스(아래로), 0: 없음. 봉 종가 기준."""
-    f, s = d['fast'].values, d['slow'].values
-    ok = np.isfinite(f) & np.isfinite(s)
-    above = np.where(ok, f > s, False)
-    prev_ok = np.concatenate([[False], ok[:-1]])
-    prev_above = np.concatenate([[False], above[:-1]])
-    up = ok & prev_ok & above & ~prev_above
-    dn = ok & prev_ok & ~above & prev_above
-    return np.where(up, 1, np.where(dn, -1, 0))
+# ===================== 데이터 =====================
+def fetch_day(day_utc, lb):
+    ex = get_ex()
+    start = day_utc + timedelta(hours=UTC_START_H) - timedelta(minutes=lb)
+    since = int(start.timestamp() * 1000)
+    need = lb + WINDOW_MIN
+    b = ex.fetch_ohlcv(SYMBOL, '1m', since=since, limit=need)
+    if len(b) < need or b[0][0] != since:
+        return None
+    df = pd.DataFrame(b, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
 
 
-# ===================== 백테스트 =====================
-def sim_symbol(d):
-    """한 종목 시뮬레이션. 반환: (거래 목록, 봉별 평가자본 배열)"""
-    o, c = d['open'].values, d['close'].values
-    ts = d['timestamp']
-    cross = cross_array(d)
-    cost = FEE + SLIP
-    eq = EQ0
-    pos, qty, entry, entry_ts = 0, 0.0, 0.0, None
-    trades, curve = [], []
-
-    for i in range(len(o)):
-        sig = cross[i - 1] if i > 0 else 0          # 전 봉 종가에서 확정된 신호
-        if sig != 0 and sig != pos:
-            if pos != 0:                              # 기존 포지션 청산
-                px = o[i] * (1 - pos * cost)          # 롱 매도는 불리하게 낮게, 숏 환매는 높게
-                pnl = (px - entry) * qty * pos
-                eq += pnl
-                trades.append(dict(dir=pos, entry_ts=entry_ts, exit_ts=ts.iloc[i],
-                                   ret=pnl / (entry * qty), pnl=pnl))
-            entry = o[i] * (1 + sig * cost)           # 롱 매수는 높게, 숏 매도는 낮게
-            qty = eq * POS_FRAC / entry
-            pos, entry_ts = int(sig), ts.iloc[i]
-        curve.append(eq + ((c[i] - entry) * qty * pos if pos else 0.0))
-    # 마지막 보유분은 종가 평가(미청산)
-    open_pos = dict(dir=pos, entry_ts=entry_ts, price=entry) if pos else None
-    return trades, np.array(curve), open_pos
+def synth_day(day_utc, lb):
+    rng = np.random.default_rng(int(day_utc.timestamp()))
+    n = lb + WINDOW_MIN
+    c = 60000 * np.exp(np.cumsum(rng.normal(0, 0.0008, n)))
+    o = np.concatenate([[60000], c[:-1]])
+    h = np.maximum(o, c) * (1 + np.abs(rng.normal(0, 0.0003, n)))
+    l = np.minimum(o, c) * (1 - np.abs(rng.normal(0, 0.0003, n)))
+    ts = pd.date_range(day_utc.replace(tzinfo=None) + timedelta(hours=UTC_START_H) - timedelta(minutes=lb),
+                       periods=n, freq='min')
+    return pd.DataFrame({'timestamp': ts, 'open': o, 'high': h, 'low': l, 'close': c, 'volume': 1.0})
 
 
+# ===================== 통계 =====================
 def stats(rets):
     n = len(rets)
     if n == 0:
@@ -107,115 +125,50 @@ def stats(rets):
 
 def fmt(m):
     pf = f"{m['pf']:.2f}" if np.isfinite(m['pf']) else "inf"
-    return f"n={m['n']:>3} 승률={m['wr']:5.1f}% 평균={m['avg']:+.2f}% PF={pf:>5}"
+    return f"n={m['n']:>4} 승률={m['wr']:5.1f}% 평균={m['avg']:+.3f}% PF={pf:>5}"
 
 
-def backtest(days, symbols, use_synth):
-    data = load_data(days, symbols, use_synth)
-    if not data:
-        print("사용 가능한 데이터가 없습니다.")
+# ===================== 백테스트 =====================
+def backtest(days, lb, use_synth):
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    trades = []
+    print(f"\n===== 한국시간 {START_H}~{END_H}시 단타 백테스트 (최근 {days}일, 신호 구간 {lb}분) =====")
+    print(f"진입 {NOTIONAL:,.0f} USDT x 1배 | 익절 +{TP * 100:.2f}% / 손절 -{SL * 100:.2f}% | "
+          f"수수료 {FEE * 100:.2f}% + 슬리피지 {SLIP * 100:.2f}% (편도)\n")
+    for k in range(days, 0, -1):                      # 오늘은 아직 끝나지 않았을 수 있어 제외
+        day = today - timedelta(days=k)
+        try:
+            df = synth_day(day, lb) if use_synth else fetch_day(day, lb)
+        except Exception as e:
+            print(f"  {day:%Y-%m-%d} 수집 실패: {e}")
+            continue
+        if df is None:
+            continue
+        t = run_day(df, lb)
+        if t:
+            trades.append(t)
+        if not use_synth and (days - k + 1) % 100 == 0:
+            print(f"  ... {days - k + 1}/{days}일 처리")
+
+    if not trades:
+        print("거래가 없습니다 (데이터 없음).")
         return
-    print(f"\n===== {FAST}/{SLOW} 이동평균 교차 백테스트 ({TF}, 투입 {POS_FRAC * 100:.0f}%) =====")
-    print(f"종목별로 각각 {EQ0:,.0f} USDT로 독립 시뮬레이션 | 수수료 {FEE * 100:.2f}% + 슬리피지 {SLIP * 100:.2f}% (편도)\n")
-    print(f"{'종목':<14}{'기간':>7} | {'수익률':>8} {'낙폭':>7} {'단순보유':>9} | 거래")
+    pnl = np.array([t['pnl'] for t in trades])
+    curve = np.cumsum(pnl)
+    peak = np.maximum.accumulate(np.concatenate([[0.0], curve]))[1:]
+    mdd = (curve - peak).min()
 
-    all_rets, rows = [], []
-    for s, d in data.items():
-        trades, curve, open_pos = sim_symbol(d)
-        ret = curve[-1] / EQ0 - 1
-        mdd = (curve / np.maximum.accumulate(curve) - 1).min()
-        bh = d['close'].iloc[-1] / d['close'].iloc[0] - 1
-        span = (d['timestamp'].iloc[-1] - d['timestamp'].iloc[0]).days
-        rets = [t['ret'] for t in trades]
-        all_rets += rets
-        rows.append((ret, mdd, bh))
-        print(f"{s:<14}{span:>6}일 | {ret * 100:>+7.1f}% {mdd * 100:>6.1f}% {bh * 100:>+8.1f}% | {fmt(stats(rets))}")
-
-    r = np.array(rows) * 100
-    print(f"\n평균 (종목 동일가중)  수익률 {r[:, 0].mean():+.1f}% | 낙폭 {r[:, 1].mean():.1f}% | 단순보유 {r[:, 2].mean():+.1f}%")
-    print(f"플러스 종목 {int((r[:, 0] > 0).sum())}/{len(r)}개 | 전체 거래 {fmt(stats(all_rets))}")
-
+    print(f"\n전체: {fmt(stats([t['ret'] for t in trades]))}")
+    print(f"누적 손익 {pnl.sum():+,.2f} USDT | 최대 낙폭 {mdd:,.2f} USDT | "
+          f"1회 평균 {pnl.mean():+.2f} USDT")
     for dr, name in ((1, '롱'), (-1, '숏')):
-        rr = []
-        for d in data.values():
-            rr += [t['ret'] for t in sim_symbol(d)[0] if t['dir'] == dr]
-        print(f"  {name}: {fmt(stats(rr))}")
-
-    print("\n※ 펀딩비, 청산 위험, 실제 호가 체결은 반영되지 않았습니다. 과거 성과는 미래를 보장하지 않습니다.")
-    print("※ 종목 목록이 '현재 거래량 상위'라 선택 편향이 있습니다.")
-
-
-# ===================== 데이터 =====================
-def get_universe(symbols, n):
-    if symbols:
-        return [f"{b.strip().upper()}/USDT:USDT" for b in symbols.split(",")]
-    try:
-        ex = get_ex()
-        ex.load_markets()
-        tk = ex.fetch_tickers()
-        cands = []
-        for s, t in tk.items():
-            m = ex.markets.get(s)
-            if not m or not m.get('swap') or not m.get('linear') or m.get('quote') != 'USDT' or m.get('active') is False:
-                continue
-            cands.append((t.get('quoteVolume') or 0, s))
-        cands.sort(reverse=True)
-        return [s for _, s in cands[:n]]
-    except Exception as e:
-        print("종목 목록 조회 실패, 기본 목록 사용:", e)
-        return [f"{b}/USDT:USDT" for b in ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "LTC"][:n]]
-
-
-def fetch_history(sym, days, tf):
-    ex = get_ex()
-    step = ex.parse_timeframe(tf) * 1000
-    since = ex.milliseconds() - int((days + 5) * 86400000)
-    out = []
-    while True:
-        b = ex.fetch_ohlcv(sym, tf, since=since, limit=1000)
-        if not b:
-            break
-        out += b
-        since = b[-1][0] + step
-        if len(b) < 1000:
-            break
-    df = pd.DataFrame(out, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df = df.drop_duplicates('timestamp').reset_index(drop=True)
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    return df.iloc[:-1].reset_index(drop=True)          # 형성 중인 마지막 봉 제외
-
-
-def synthetic_universe(n, days, seed=7):
-    rng = np.random.default_rng(seed)
-    ts = pd.date_range('2023-01-01', periods=days, freq='D')
-    data = {}
-    for k in range(n):
-        r = rng.normal(0.0004, 0.03, days)
-        c = 100 * np.exp(np.cumsum(r))
-        o = np.concatenate([[100], c[:-1]])
-        data[f"SYN{k}/USDT:USDT"] = pd.DataFrame({'timestamp': ts, 'open': o, 'high': np.maximum(o, c),
-                                                  'low': np.minimum(o, c), 'close': c, 'volume': 1.0})
-    return data
-
-
-def load_data(days, symbols, use_synth):
-    n = len(symbols.split(",")) if symbols else N_SYMBOLS
-    if use_synth:
-        raw = synthetic_universe(n, days)
-    else:
-        syms = get_universe(symbols, N_SYMBOLS)
-        print(f"{len(syms)}종목 데이터 수집 중... ({days}일, {TF})")
-        raw = {}
-        for k, s in enumerate(syms, 1):
-            try:
-                df = fetch_history(s, days, TF)
-                if len(df) < SLOW + 5:
-                    print(f"  [{k}/{len(syms)}] {s}: 데이터 부족({len(df)}봉), 제외")
-                    continue
-                raw[s] = df
-            except Exception as e:
-                print(f"  [{k}/{len(syms)}] {s}: 수집 실패 ({e})")
-    return {s: add_ma(df) for s, df in raw.items()}
+        print(f"  {name}: {fmt(stats([t['ret'] for t in trades if t['dir'] == dr]))}")
+    cnt = {r: sum(1 for t in trades if t['reason'] == r) for r in ('TP', 'SL', 'TIME')}
+    print(f"청산 사유: 익절 {cnt['TP']}회 | 손절 {cnt['SL']}회 | 24시 강제청산 {cnt['TIME']}회")
+    wins_net = np.mean([t['ret'] for t in trades if t['reason'] == 'TP']) * 100 if cnt['TP'] else TP * 100
+    print(f"\n※ 비용 반영 시 익절 순수익은 약 {wins_net:.2f}%, 손절 순손실은 약 {(SL + 2 * COST) * 100:.2f}% 입니다.")
+    print("※ 펀딩비(한국시간 01시/09시/17시 정산이라 이 시간대엔 없음), 호가 체결 오차는 반영되지 않았습니다.")
+    print("※ 과거 성과는 미래를 보장하지 않습니다.")
 
 
 # ===================== 모의매매 (주문 없음) =====================
@@ -227,83 +180,83 @@ def db():
 
 def setup_db():
     conn = db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS paper (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, side TEXT NOT NULL,
-        entry_ts TEXT NOT NULL, entry_price REAL NOT NULL,
-        status TEXT DEFAULT 'OPEN', exit_ts TEXT, exit_price REAL, ret REAL)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS night (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, side TEXT NOT NULL,
+        entry_ts TEXT NOT NULL, entry_price REAL NOT NULL, tp_px REAL NOT NULL, sl_px REAL NOT NULL,
+        status TEXT DEFAULT 'OPEN', exit_ts TEXT, exit_price REAL, reason TEXT, ret REAL, pnl REAL)''')
     conn.commit()
     conn.close()
 
 
 def paper_stats():
     conn = db()
-    rows = conn.execute("SELECT ret FROM paper WHERE status='CLOSED' ORDER BY id").fetchall()
+    rows = conn.execute("SELECT ret, pnl FROM night WHERE status='CLOSED' ORDER BY id").fetchall()
     conn.close()
     if not rows:
         print("[모의 누적] 완료된 거래 없음")
         return
-    rs = [r['ret'] for r in rows]
-    eq = EQ0
-    for r in rs:
-        eq += eq * POS_FRAC * r
-    print(f"[모의 누적] {fmt(stats(rs))} | 종목 합산 가정 가상 자본 {EQ0:,.0f} -> {eq:,.0f}")
+    print(f"[모의 누적] {fmt(stats([r['ret'] for r in rows]))} | 누적 손익 {sum(r['pnl'] for r in rows):+,.2f} USDT")
 
 
-def paper_cycle(syms):
-    ex = get_ex()
-    for s in syms:
-        try:
-            raw = ex.fetch_ohlcv(s, TF, limit=60)
-        except Exception as e:
-            print(f"{s} 조회 실패: {e}")
-            continue
-        forming_ts = pd.to_datetime(raw[-1][0], unit='ms')
-        forming_open = float(raw[-1][1])
-        closed = pd.DataFrame(raw[:-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        closed['timestamp'] = pd.to_datetime(closed['timestamp'], unit='ms')
-        sig = int(cross_array(add_ma(closed))[-1])          # 방금 마감된 봉에서 교차가 났는가
-        if sig == 0:
-            continue
+def last_price():
+    return float(get_ex().fetch_ticker(SYMBOL)['last'])
 
-        conn = db()
-        cur = conn.execute("SELECT * FROM paper WHERE symbol=? AND status='OPEN'", (s,)).fetchone()
-        cur_dir = 0 if cur is None else (1 if cur['side'] == 'long' else -1)
-        if cur_dir == sig:
-            conn.close()
-            continue
-        cost = FEE + SLIP
-        if cur:                                              # 기존 포지션 청산
-            px = forming_open * (1 - cur_dir * cost)
-            r = cur_dir * (px - cur['entry_price']) / cur['entry_price']
-            conn.execute("UPDATE paper SET status='CLOSED', exit_ts=?, exit_price=?, ret=? WHERE id=?",
-                         (forming_ts.isoformat(), px, r, cur['id']))
-            print(f"[모의] 청산 {s} {cur['side']} {r * 100:+.2f}%")
-        entry = forming_open * (1 + sig * cost)
-        conn.execute("INSERT INTO paper (symbol, side, entry_ts, entry_price) VALUES (?, ?, ?, ?)",
-                     (s, 'long' if sig == 1 else 'short', forming_ts.isoformat(), entry))
-        conn.commit()
-        conn.close()
-        print(f"[모의] 진입 {s} {'LONG' if sig == 1 else 'SHORT'} {entry:,.4f} (자본의 {POS_FRAC * 100:.0f}%)")
+
+def enter(now, lb):
+    raw = get_ex().fetch_ohlcv(SYMBOL, '1m', limit=lb + 5)
+    closed = raw[:-1]                                  # 형성 중인 봉 제외
+    ref, last = float(closed[-lb][1]), float(closed[-1][4])
+    sig = 1 if last > ref else -1
+    entry = last_price() * (1 + sig * COST)
+    tp_px, sl_px = entry * (1 + sig * TP), entry * (1 - sig * SL)
+    conn = db()
+    conn.execute("INSERT INTO night (day, side, entry_ts, entry_price, tp_px, sl_px) VALUES (?,?,?,?,?,?)",
+                 (now.strftime('%Y-%m-%d'), 'long' if sig == 1 else 'short', now.isoformat(), entry, tp_px, sl_px))
+    conn.commit()
+    conn.close()
+    print(f"[모의] 진입 {'LONG' if sig == 1 else 'SHORT'} {entry:,.2f} | 익절 {tp_px:,.2f} | 손절 {sl_px:,.2f} "
+          f"(직전 {lb}분 {ref:,.2f} -> {last:,.2f}, {NOTIONAL:,.0f} USDT)")
+
+
+def close_pos(pos, price, reason, now):
+    d = 1 if pos['side'] == 'long' else -1
+    px = price * (1 - d * COST)
+    ret = d * (px - pos['entry_price']) / pos['entry_price']
+    conn = db()
+    conn.execute("UPDATE night SET status='CLOSED', exit_ts=?, exit_price=?, reason=?, ret=?, pnl=? WHERE id=?",
+                 (now.isoformat(), px, reason, ret, ret * NOTIONAL, pos['id']))
+    conn.commit()
+    conn.close()
+    label = {'TP': '익절', 'SL': '손절', 'TIME': '24시 강제청산'}[reason]
+    print(f"[모의] {label} {pos['side']} {ret * 100:+.3f}% ({ret * NOTIONAL:+.2f} USDT)")
     paper_stats()
 
 
-def paper_main(symbols):
+def paper_main(lb):
     setup_db()
-    syms = get_universe(symbols, N_SYMBOLS)
-    print(f"\n=== {FAST}/{SLOW} 이평선 교차 모의매매 === {datetime.now():%Y-%m-%d %H:%M}")
-    print(f"감시 {len(syms)}종목 | {TF} | 투입 {POS_FRAC * 100:.0f}% | 주문 없음 (Ctrl+C 종료)")
-    step = 24 * 3600
-    now = time.time()
-    last_bucket = None if now % step < 300 else int(now // step)   # 일봉 마감(UTC 00:00) 직후 1회 점검
+    print(f"\n=== 한국시간 {START_H}~{END_H}시 단타 모의매매 === {datetime.now(KST):%Y-%m-%d %H:%M}")
+    print(f"{SYMBOL} | {NOTIONAL:,.0f} USDT x 1배 | 익절 +{TP * 100:.2f}% / 손절 -{SL * 100:.2f}% | 주문 없음 (Ctrl+C 종료)")
     while True:
         try:
-            now = time.time()
-            bucket = int(now // step)
-            if bucket != last_bucket and now % step >= 15:
-                last_bucket = bucket
-                print(f"\n[{datetime.now():%m-%d %H:%M}] 점검")
-                paper_cycle(syms)
-            time.sleep(30)
+            now = datetime.now(KST)
+            in_window = START_H <= now.hour < END_H
+            conn = db()
+            pos = conn.execute("SELECT * FROM night WHERE status='OPEN'").fetchone()
+            done_today = conn.execute("SELECT 1 FROM night WHERE day=?", (now.strftime('%Y-%m-%d'),)).fetchone()
+            conn.close()
+
+            if pos:
+                price = last_price()
+                d = 1 if pos['side'] == 'long' else -1
+                if (d == 1 and price <= pos['sl_px']) or (d == -1 and price >= pos['sl_px']):
+                    close_pos(pos, price, 'SL', now)
+                elif (d == 1 and price >= pos['tp_px']) or (d == -1 and price <= pos['tp_px']):
+                    close_pos(pos, price, 'TP', now)
+                elif not in_window:
+                    close_pos(pos, price, 'TIME', now)
+            elif now.hour == START_H and now.minute < 5 and not done_today:
+                enter(now, lb)                         # 22:00~22:05 사이에만 진입, 늦게 켜면 그날은 건너뜀
+            time.sleep(10)
         except KeyboardInterrupt:
             print("종료")
             break
@@ -314,15 +267,15 @@ def paper_main(symbols):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backtest", type=int, metavar="DAYS", help="백테스트 (1000 권장)")
-    ap.add_argument("--symbols", default="", help="종목 지정 예: BTC,ETH (비우면 거래량 상위 10개)")
+    ap.add_argument("--backtest", type=int, metavar="DAYS", help="백테스트 일수 (예: 365)")
+    ap.add_argument("--lookback", type=int, default=LOOKBACK, help="22시 기준 방향 판단 구간(분), 기본 60")
     ap.add_argument("--synthetic", action="store_true", help="가짜 데이터로 동작 점검")
     ap.add_argument("--stats", action="store_true", help="모의매매 누적 성적")
     args = ap.parse_args()
     if args.backtest:
-        backtest(args.backtest, args.symbols, args.synthetic)
+        backtest(args.backtest, args.lookback, args.synthetic)
     elif args.stats:
         setup_db()
         paper_stats()
     else:
-        paper_main(args.symbols)
+        paper_main(args.lookback)
